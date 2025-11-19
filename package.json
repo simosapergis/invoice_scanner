@@ -1,0 +1,13 @@
+{
+  "name": "invoice_scanner",
+  "version": "1.0.0",
+  "description": "CLI tool that uses GPT-4o to extract Greek invoice fields via OCR.",
+  "type": "module",
+  "scripts": {
+    "invoice:ocr": "node invoice_ocr.js"
+  },
+  "dependencies": {
+    "openai": "^4.77.0"
+  }
+}
+
