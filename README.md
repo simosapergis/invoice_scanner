@@ -31,6 +31,25 @@ npm run auth:login
 
 The script calls Firebase Authentication’s REST API and prints the ID token and refresh token, which you can then use to request signed upload URLs from your backend.
 
+### Signed URL API (Node server)
+```bash
+export FIREBASE_PROJECT_ID=your-project-id
+export GCS_BUCKET=your-upload-bucket
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
+npm run signed-url:server
+```
+
+Request an upload URL with the ID token you obtained earlier:
+
+```bash
+curl -X POST http://localhost:8080/signed-url \
+  -H "Authorization: Bearer $FIREBASE_ID_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"filename":"invoice.jpg","contentType":"image/jpeg"}'
+```
+
+The response contains a `uploadUrl` (V4 signed URL) and `objectName`. Upload the file via HTTP PUT using the provided `uploadUrl`.
+
 ## Windows (PowerShell)
 ### Installation
 ```powershell
@@ -47,4 +66,10 @@ node invoice_ocr.js .\my_invoice.pdf
 # Firebase email/password login (prints ID token)
 $env:FIREBASE_API_KEY = "your-firebase-web-api-key"
 npm run auth:login
+
+# Signed URL server
+$env:FIREBASE_PROJECT_ID = "your-project-id"
+$env:GCS_BUCKET = "your-upload-bucket"
+$env:GOOGLE_APPLICATION_CREDENTIALS = "C:\path\to\service-account.json"
+npm run signed-url:server
 ```
