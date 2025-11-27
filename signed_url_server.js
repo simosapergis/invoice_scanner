@@ -28,52 +28,90 @@ const storage = new Storage();
 const app = express();
 app.use(express.json());
 
-function extractBearerToken(headerValue) {
+export function extractBearerToken(headerValue) {
   if (!headerValue) return null;
   const match = headerValue.match(/^Bearer\s+(.+)$/i);
   return match ? match[1] : null;
 }
 
-app.post("/signed-url", async (req, res) => {
+export async function createSignedUploadUrl(options) {
+  const {
+    adminInstance,
+    storageInstance,
+    bucketName,
+    idToken,
+    filename,
+    contentType = "application/octet-stream",
+    folder = "uploads"
+  } = options;
+
+  if (!idToken) {
+    return {
+      status: 401,
+      payload: { error: "Missing Authorization: Bearer <token>" }
+    };
+  }
+
+  if (!filename) {
+    return {
+      status: 400,
+      payload: { error: "filename is required in the request body" }
+    };
+  }
+
+  let decoded;
   try {
-    const idToken = extractBearerToken(req.header("Authorization"));
-    if (!idToken) {
-      return res.status(401).json({ error: "Missing Authorization: Bearer <token>" });
-    }
+    decoded = await adminInstance.auth().verifyIdToken(idToken);
+  } catch (error) {
+    return {
+      status: 401,
+      payload: {
+        error: "Invalid or expired Firebase ID token",
+        details: error.message
+      }
+    };
+  }
 
-    let decoded;
-    try {
-      decoded = await admin.auth().verifyIdToken(idToken);
-    } catch (error) {
-      return res.status(401).json({ error: "Invalid or expired Firebase ID token", details: error.message });
-    }
+  const sanitizedFilename = filename.replace(/[^a-zA-Z0-9._-]/g, "_");
+  const objectName = `${folder}/${decoded.uid}/${Date.now()}-${sanitizedFilename}`;
+  const expiresAtMs = Date.now() + 15 * 60 * 1000; // 15 minutes
 
-    const { filename, contentType = "application/octet-stream", folder = "uploads" } = req.body ?? {};
-    if (!filename) {
-      return res.status(400).json({ error: "filename is required in the request body" });
-    }
+  const bucket = storageInstance.bucket(bucketName);
+  const file = bucket.file(objectName);
 
-    const sanitizedFilename = filename.replace(/[^a-zA-Z0-9._-]/g, "_");
-    const objectName = `${folder}/${decoded.uid}/${Date.now()}-${sanitizedFilename}`;
-    const expiresAtMs = Date.now() + 15 * 60 * 1000; // 15 minutes
+  const [signedUrl] = await file.getSignedUrl({
+    version: "v4",
+    action: "write",
+    expires: expiresAtMs,
+    contentType
+  });
 
-    const bucket = storage.bucket(GCS_BUCKET);
-    const file = bucket.file(objectName);
-
-    const [signedUrl] = await file.getSignedUrl({
-      version: "v4",
-      action: "write",
-      expires: expiresAtMs,
-      contentType
-    });
-
-    return res.json({
+  return {
+    status: 200,
+    payload: {
       uploadUrl: signedUrl,
-      bucket: GCS_BUCKET,
+      bucket: bucketName,
       objectName,
       contentType,
       expiresAt: new Date(expiresAtMs).toISOString()
+    }
+  };
+}
+
+app.post("/signed-url", async (req, res) => {
+  try {
+    const idToken = extractBearerToken(req.header("Authorization"));
+    const result = await createSignedUploadUrl({
+      adminInstance: admin,
+      storageInstance: storage,
+      bucketName: GCS_BUCKET,
+      idToken,
+      filename: req.body?.filename,
+      contentType: req.body?.contentType,
+      folder: req.body?.folder
     });
+
+    return res.status(result.status).json(result.payload);
   } catch (error) {
     console.error("Failed to create signed URL:", error);
     return res.status(500).json({ error: "Internal server error" });

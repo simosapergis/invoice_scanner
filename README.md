@@ -50,6 +50,13 @@ curl -X POST http://localhost:8080/signed-url \
 
 The response contains a `uploadUrl` (V4 signed URL) and `objectName`. Upload the file via HTTP PUT using the provided `uploadUrl`.
 
+### Cloud Function (production)
+Deploy the same logic to Firebase Functions:
+1. Set the bucket config once:  
+   `firebase functions:config:set uploads.bucket="your-upload-bucket"`
+2. Deploy: `firebase deploy --only functions:getSignedUploadUrl`
+3. Call the HTTPS endpoint (e.g. `https://<region>-<project>.cloudfunctions.net/getSignedUploadUrl`) with the same POST body and `Authorization: Bearer <Firebase ID token>`.
+
 ## Windows (PowerShell)
 ### Installation
 ```powershell
@@ -72,4 +79,8 @@ $env:FIREBASE_PROJECT_ID = "your-project-id"
 $env:GCS_BUCKET = "your-upload-bucket"
 $env:GOOGLE_APPLICATION_CREDENTIALS = "C:\path\to\service-account.json"
 npm run signed-url:server
+
+# Cloud Function config (one-time)
+firebase functions:config:set uploads.bucket="your-upload-bucket"
+firebase deploy --only functions:getSignedUploadUrl
 ```
