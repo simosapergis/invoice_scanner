@@ -1,6 +1,7 @@
 {
   "functions": {
-    "source": "functions"
+    "source": "functions",
+    "defaultRegion": "europe-west8"
   },
   "emulators": {
     "auth": {

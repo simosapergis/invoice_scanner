@@ -5,7 +5,7 @@ const { Storage } = require('@google-cloud/storage');
 admin.initializeApp();
 
 const storage = new Storage();
-const DEFAULT_FOLDER = 'uploads';
+const DEFAULT_FOLDER = 'invoices';
 
 function extractBearerToken(headerValue) {
   if (!headerValue) return null;
