@@ -17,6 +17,16 @@ const REQUIRED_FIELDS = [
   'ΑΚΡΙΒΕΙΑ'
 ];
 
+const FIELD_LABELS = {
+  'ΗΜΕΡΟΜΗΝΙΑ': 'invoiceDate',
+  'ΑΡΙΘΜΟΣ ΤΙΜΟΛΟΓΙΟΥ': 'invoiceNumber',
+  'ΠΡΟΜΗΘΕΥΤΗΣ': 'supplierName',
+  'ΣΥΝΟΛΟ ΧΩΡΙΣ ΦΠΑ': 'subtotal',
+  'ΦΠΑ': 'vat',
+  'ΤΕΛΙΚΟ ΠΟΣΟ': 'totalAmount',
+  'ΑΚΡΙΒΕΙΑ': 'confidence'
+};
+
 const openAiApiKey = process.env.OPENAI_API_KEY || functions.config().openai?.key;
 const openaiClient = openAiApiKey ? new OpenAI({ apiKey: openAiApiKey }) : null;
 
@@ -207,7 +217,14 @@ exports.processUploadedInvoice = functions.storage.object().onFinalize(async (ob
 
       const ocrResult = await runInvoiceOcr(buffer, mimeType);
       if (ocrResult) {
-        console.log('OCR extraction result:', JSON.stringify(ocrResult, null, 2));
+        const mappedResult = Object.entries(ocrResult).reduce((acc, [key, value]) => {
+          const englishKey = FIELD_LABELS[key] || key;
+          acc[englishKey] = value;
+          return acc;
+        }, {});
+
+        console.log('OCR extraction (GR):', JSON.stringify(ocrResult, null, 2));
+        console.log('OCR extraction (EN):', JSON.stringify(mappedResult, null, 2));
       } else {
         console.warn('OCR result was empty.');
       }
