@@ -11,6 +11,7 @@ const REQUIRED_FIELDS = [
   "ΗΜΕΡΟΜΗΝΙΑ",
   "ΑΡΙΘΜΟΣ ΤΙΜΟΛΟΓΙΟΥ",
   "ΠΡΟΜΗΘΕΥΤΗΣ",
+  "ΑΦΜ ΠΡΟΜΗΘΕΥΤΗ",
   "ΣΥΝΟΛΟ ΧΩΡΙΣ ΦΠΑ",
   "ΦΠΑ",
   "ΤΕΛΙΚΟ ΠΟΣΟ"
@@ -85,12 +86,23 @@ async function main() {
   }
 
   // 2) Δευτερογενής εξαγωγή πεδίων μέσω OpenAI (text‑only)
-  const systemPrompt =
-    "You are an expert accountant specializing in OCR for European invoices. " +
-    "You will receive the raw text extracted from an invoice (which contains Greek text). " +
-    "Using ONLY this text, extract the requested fields. " +
-    "Respond strictly in JSON that matches the provided schema. " +
-    "If a value is missing, return null. Amounts must use dot-decimal notation (e.g. 1234.56) and omit currency symbols.";
+  const systemPrompt = [
+    "You are an expert accountant specializing in OCR for European invoices.",
+    "",
+    "You will receive the raw text extracted from an invoice (which may contain Greek text).",
+    "",
+    "IMPORTANT RULES:",
+    "1. The supplier/vendor (ΠΡΟΜΗΘΕΥΤΗΣ) is ALWAYS the entity printed at the top of the invoice.",
+    "2. The supplier VAT number (ΑΦΜ ΠΡΟΜΗΘΕΥΤΗ) is ALWAYS located near the supplier’s address/logo.",
+    "3. The customer/buyer (ΠΕΛΑΤΗΣ) appears typically under a section titled “ΠΡΟΣ”, “ΠΕΛΑΤΗΣ”, “ΑΠΟΔΕΚΤΗΣ”.",
+    "4. NEVER confuse the customer with the supplier.",
+    "5. If more than one VAT number (ΑΦΜ) is detected, choose the one closest to the supplier section.",
+    "6. Extract ONLY the supplier VAT number — NOT the customer VAT number.",
+    "",
+    "Respond strictly in JSON that matches the provided schema.",
+    "If a value is missing or uncertain, return null.",
+    "Use dot-decimal notation for amounts (e.g. 1234.56) and omit currency symbols."
+  ].join("\n");
 
   const extractionPrompt =
     "Παρακάτω σου δίνω ΟΛΟ το κείμενο ενός τιμολογίου όπως προέκυψε από OCR. " +
