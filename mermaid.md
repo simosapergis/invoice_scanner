@@ -1,55 +1,36 @@
 ```mermaid
 flowchart TD
-  %% CLIENT SIDE
-  A1[User Takes Photo in PWA] --> A2[Image File Received]
 
-  subgraph Client_Side[Client-Side Processing PWA]
-    A2 --> A3[Detect Format]
-    A3 -->|If HEIC/PNG/WebP| A4[Convert to JPEG Canvas / heic2any fallback]
-    A3 -->|If JPEG| A5[Skip Conversion]
+    %% CLIENT SIDE
+    A[User takes photo\n PWA] --> B[Client checks image quality\nresolution, blur, file type]
+    B -->|If HEIC/PNG| C[Convert to JPG client-side]
+    B -->|If OK| C
 
-    A4 --> A6[Quality Checks]
-    A5 --> A6[Quality Checks]
+    C --> D[Request Signed URL from Cloud Function]
+    D --> E[Upload raw file to GCS\nraw-invoices/uploadId/original.jpg]
 
-    subgraph Quality_Checks[Quality Checks]
-      A6a[Resolution Check] --> A6b[Blur Detection] --> A6c[Brightness Check]
-    end
+    E --> F[Return success to app immediately]
+    F --> G[App shows 'Processing Invoice' screen]
 
-    A6 -->|If fails| A7[Prompt user to retake photo]
-    A6 -->|If OK| A8[Request Signed URL from Backend]
-  end
+    %% SERVER SIDE
+    E --> H[Cloud Function Trigger:\nonFinalize raw-invoices/...]
+    H --> I[Download uploaded file]
+    I --> J[Convert to PDF server-side]
 
-  A8 --> A9[Upload JPEG to GCS via Signed URL]
-  A9 --> A10[GCS stores raw image]
+    J --> K[Send file to OpenAI API\nOCR + Data Extraction]
 
-  %% BACKEND SIDE
-  A10 --> B1[GCS Finalize Event Trigger]
+    K --> L[Extract supplier data:\nname, VAT, identifiers]
 
-  subgraph Cloud_Run_Worker[Cloud Run Worker Serverless Async Pipeline]
-    B1 --> B2[Load JPEG from GCS]
-    B2 --> B3[Send Image to OpenAI OCR/Extraction]
-    B3 --> B4[Extract Structured Invoice Data]
-    B4 --> B5[Save to Firestore: status='completed', pdfStatus='pending']
-    B5 --> B6[Send FCM Notification: 'Invoice Processed']
+    L --> MDoes supplier exist\nin Firestore?
+    M -->|Yes| N[Get supplierId]
+    M -->|No| O[Create supplier\ndocument in Firestore]
+    O --> N
 
-    B4 --> B7[Async: Start PDF Generation Job]
-    B7 --> B8[Generate PDF from Original JPEGs]
-    B8 --> B9[Upload PDF to GCS]
-    B9 --> B10[Update Firestore: pdfStatus='completed']
-  end
+    N --> P[Create invoiceId]
+    P --> Q[Move file:\ncopy raw → suppliers/supplierId/invoices/invoiceId.pdf]
+    Q --> R[Delete raw file]
 
-  %% FIRESTORE & NOTIFICATIONS
-  B6 --> C1[Firestore Document Updated]
-  B10 --> C1
+    R --> S[Create invoice document in Firestore]
+    S --> T[Send FCM notification: 'Invoice ready']
 
-  subgraph Firestore[Firestore State Machine]
-    C1 -->|status='pending'| C2[UI: Processing Spinner]
-    C1 -->|status='completed'| C3[UI: Show Extracted Data]
-    C1 -->|pdfStatus='completed'| C4[UI: PDF Ready for Download]
-    C1 -->|status='error'| C5[UI: Retry or Reupload]
-  end
-
-  C1 --> D1[FCM Push Notification to PWA]
-
-  %% UX
-  D1 --> E1[PWA Updates UI in Real Time]
+    T --> U[User opens invoice details screen]

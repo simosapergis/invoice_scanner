@@ -3,14 +3,17 @@ const admin = require('firebase-admin');
 const { Storage } = require('@google-cloud/storage');
 const OpenAI = require('openai');
 
-admin.initializeApp();
+const app = admin.initializeApp();
 
 const storage = new Storage();
+const db = admin.firestore();
+console.log(`[init] Firestore database set to ${app.options.projectId}/(default)`);
 const DEFAULT_FOLDER = 'invoices';
 const REQUIRED_FIELDS = [
   'ΗΜΕΡΟΜΗΝΙΑ',
   'ΑΡΙΘΜΟΣ ΤΙΜΟΛΟΓΙΟΥ',
   'ΠΡΟΜΗΘΕΥΤΗΣ',
+  'ΑΦΜ ΠΡΟΜΗΘΕΥΤΗ',
   'ΣΥΝΟΛΟ ΧΩΡΙΣ ΦΠΑ',
   'ΦΠΑ',
   'ΤΕΛΙΚΟ ΠΟΣΟ',
@@ -21,6 +24,7 @@ const FIELD_LABELS = {
   'ΗΜΕΡΟΜΗΝΙΑ': 'invoiceDate',
   'ΑΡΙΘΜΟΣ ΤΙΜΟΛΟΓΙΟΥ': 'invoiceNumber',
   'ΠΡΟΜΗΘΕΥΤΗΣ': 'supplierName',
+  'ΑΦΜ ΠΡΟΜΗΘΕΥΤΗ': 'supplierTaxNumber',
   'ΣΥΝΟΛΟ ΧΩΡΙΣ ΦΠΑ': 'subtotal',
   'ΦΠΑ': 'vat',
   'ΤΕΛΙΚΟ ΠΟΣΟ': 'totalAmount',
@@ -38,6 +42,31 @@ function extractBearerToken(headerValue) {
 
 function sanitizeFilename(name) {
   return name.replace(/[^a-zA-Z0-9._-]/g, '_');
+}
+
+function sanitizeId(value, fallback) {
+  if (!value) return fallback;
+  return value
+    .toString()
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .substring(0, 64) || fallback;
+}
+
+function parseAmount(value) {
+  if (value === null || value === undefined) return null;
+  const normalized = value.toString().replace(/[^\d,.-]/g, '').replace(',', '.');
+  const num = Number(normalized);
+  return Number.isFinite(num) ? num : null;
+}
+
+function parseDate(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return admin.firestore.Timestamp.fromDate(date);
 }
 
 function collectResponseText(response) {
@@ -76,11 +105,23 @@ async function runInvoiceOcr(buffer, mimeType) {
   }
 
   const base64 = buffer.toString('base64');
-  const systemPrompt =
-    'You are an expert accountant specializing in OCR for European invoices. ' +
-    'Read the provided invoice (which may contain Greek text) and extract the requested fields. ' +
-    'Respond strictly in JSON that matches the provided schema. ' +
-    'If a value is missing, return null. Amounts must use dot-decimal notation (e.g. 1234.56) and omit currency symbols.';
+  const systemPrompt = [
+    'You are an expert accountant specializing in OCR for European invoices.',
+    '',
+    'Your task is to extract fields from invoices that may contain Greek text.',
+    '',
+    'IMPORTANT RULES:',
+    '1. The supplier/vendor (ΠΡΟΜΗΘΕΥΤΗΣ) is ALWAYS the entity printed at the top of the invoice.',
+    '2. The supplier VAT number (ΑΦΜ ΠΡΟΜΗΘΕΥΤΗ) is ALWAYS located near the supplier’s address/logo.',
+    '3. The customer/buyer (ΠΕΛΑΤΗΣ) appears typically under a section titled “ΠΡΟΣ”, “ΠΕΛΑΤΗΣ”, “ΑΠΟΔΕΚΤΗΣ”.',
+    '4. NEVER confuse the customer with the supplier.',
+    '5. If more than one VAT number (ΑΦΜ) is detected, choose the one closest to the supplier section.',
+    '6. Extract ONLY the supplier VAT number — NOT the customer VAT number.',
+    '',
+    'Respond strictly in JSON.',
+    'If a value is missing or uncertain, return null.',
+    'Use dot-decimal notation for amounts (e.g. 1234.56).'
+  ].join('\n');
 
   const extractionPrompt =
     'Παρακαλώ κάνε OCR στο συνημμένο τιμολόγιο και επέστρεψε τα παρακάτω πεδία στα ελληνικά. ' +
@@ -113,6 +154,7 @@ async function runInvoiceOcr(buffer, mimeType) {
           properties: {
             'ΗΜΕΡΟΜΗΝΙΑ': { type: ['string', 'null'] },
             'ΑΡΙΘΜΟΣ ΤΙΜΟΛΟΓΙΟΥ': { type: ['string', 'null'] },
+            'ΑΦΜ ΠΡΟΜΗΘΕΥΤΗ': { type: ['string', 'null'] },
             'ΠΡΟΜΗΘΕΥΤΗΣ': { type: ['string', 'null'] },
             'ΣΥΝΟΛΟ ΧΩΡΙΣ ΦΠΑ': { type: ['string', 'null'] },
             'ΦΠΑ': { type: ['string', 'null'] },
@@ -199,36 +241,80 @@ exports.getSignedUploadUrl = functions.https.onRequest(async (req, res) => {
 });
 
 exports.processUploadedInvoice = functions.storage.object().onFinalize(async (object) => {
-    const { name: objectName, bucket, contentType } = object;
-    if (!objectName) {
-      console.warn('Finalize event missing object name');
+  const { name: objectName, bucket, contentType } = object;
+  if (!objectName) {
+    console.warn('Finalize event missing object name');
+    return;
+  }
+
+  if (!openaiClient) {
+    console.warn('Skipping OCR because OPENAI_API_KEY is not configured.');
+    return;
+  }
+
+  try {
+    console.log(`Processing uploaded invoice: gs://${bucket}/${objectName}`);
+    const [buffer] = await storage.bucket(bucket).file(objectName).download();
+    const mimeType = contentType || 'application/octet-stream';
+
+    const ocrResult = await runInvoiceOcr(buffer, mimeType);
+    if (!ocrResult) {
+      console.warn('OCR result was empty.');
       return;
     }
 
-    if (!openaiClient) {
-      console.warn('Skipping OCR because OPENAI_API_KEY is not configured.');
-      return;
-    }
+    const mappedResult = Object.entries(ocrResult).reduce((acc, [key, value]) => {
+      const englishKey = FIELD_LABELS[key] || key;
+      acc[englishKey] = value;
+      return acc;
+    }, {});
 
-    try {
-      console.log(`Processing uploaded invoice: gs://${bucket}/${objectName}`);
-      const [buffer] = await storage.bucket(bucket).file(objectName).download();
-      const mimeType = contentType || 'application/octet-stream';
+    console.log('OCR extraction (GR):', JSON.stringify(ocrResult, null, 2));
+    console.log('OCR extraction (EN):', JSON.stringify(mappedResult, null, 2));
 
-      const ocrResult = await runInvoiceOcr(buffer, mimeType);
-      if (ocrResult) {
-        const mappedResult = Object.entries(ocrResult).reduce((acc, [key, value]) => {
-          const englishKey = FIELD_LABELS[key] || key;
-          acc[englishKey] = value;
-          return acc;
-        }, {});
+    const pathParts = objectName.split('/');
+    const fileBase = pathParts[pathParts.length - 1] || '';
+    const uploadId = pathParts.length >= 2 ? pathParts[1] : fileBase.split('.')[0];
+    const uploadedBy = null;
 
-        console.log('OCR extraction (GR):', JSON.stringify(ocrResult, null, 2));
-        console.log('OCR extraction (EN):', JSON.stringify(mappedResult, null, 2));
-      } else {
-        console.warn('OCR result was empty.');
-      }
-    } catch (error) {
-      console.error(`Failed to process invoice ${objectName}:`, error);
-    }
+    const supplierName = mappedResult.supplierName || 'Unknown Supplier';
+    const supplierTaxNumber = mappedResult.supplierTaxNumber || null;
+    const supplierId = sanitizeId(
+      supplierTaxNumber,
+      sanitizeId(supplierName, 'unknown-supplier')
+    );
+    const invoiceNumber =
+      mappedResult.invoiceNumber?.toString().match(/\d+/g)?.join('') || null;
+    const invoiceId = sanitizeId(uploadId, 'unknown-invoice');
+
+    const invoiceDocRef = db.doc(`suppliers/${supplierId}/invoices/${invoiceId}`);
+
+    const invoicePayload = {
+      invoiceId,
+      rawFilePath: objectName,
+      filePath: `suppliers/${supplierId}/invoices/${invoiceId}.pdf`,
+      uploadedBy,
+      supplierId,
+      supplierName,
+      supplierTaxNumber,
+      invoiceNumber,
+      invoiceDate: parseDate(mappedResult.invoiceDate),
+      dueDate: parseDate(mappedResult.dueDate),
+      totalAmount: parseAmount(mappedResult.totalAmount),
+      currency: mappedResult.currency || 'EUR',
+      subtotal: parseAmount(mappedResult.subtotal),
+      vatAmount: parseAmount(mappedResult.vat),
+      vatRate: parseAmount(mappedResult.vatRate),
+      status: 'completed',
+      errorMessage: null,
+      confidence: mappedResult.confidence ? Number(mappedResult.confidence) : null,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      processedAt: admin.firestore.FieldValue.serverTimestamp()
+    };
+
+    await invoiceDocRef.set(invoicePayload, { merge: true });
+    console.log(`Stored invoice data at ${invoiceDocRef.path}`);
+  } catch (error) {
+    console.error(`Failed to process invoice ${objectName}:`, error);
+  }
   });
