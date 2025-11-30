@@ -5,11 +5,13 @@
   "type": "module",
   "scripts": {
     "invoice:ocr": "node invoice_ocr.js",
+    "invoice:ocr2": "node invoice_ocr_2.js",
     "auth:login": "node auth_login.js",
     "signed-url:server": "node signed_url_server.js"
   },
   "dependencies": {
     "@google-cloud/storage": "^7.11.1",
+    "@google-cloud/vision": "^5.3.4",
     "express": "^4.19.2",
     "firebase-admin": "^12.1.1",
     "openai": "^4.77.0"
