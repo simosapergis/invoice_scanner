@@ -10,6 +10,7 @@ const storage = new Storage();
 const db = admin.firestore();
 console.log(`[init] Firestore database set to ${app.options.projectId}/(default)`);
 const DEFAULT_FOLDER = 'invoices';
+const UPLOADS_PREFIX = 'uploads/';
 const REQUIRED_FIELDS = [
   'ΗΜΕΡΟΜΗΝΙΑ',
   'ΑΡΙΘΜΟΣ ΤΙΜΟΛΟΓΙΟΥ',
@@ -268,6 +269,11 @@ exports.processUploadedInvoice = functions.storage.object().onFinalize(async (ob
   const { name: objectName, bucket, contentType } = object;
   if (!objectName) {
     console.warn('Finalize event missing object name');
+    return;
+  }
+
+  if (!objectName.startsWith(UPLOADS_PREFIX)) {
+    console.log(`Skipping ${objectName} because it is outside ${UPLOADS_PREFIX}`);
     return;
   }
 
