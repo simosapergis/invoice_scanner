@@ -1,6 +1,7 @@
 const functions = require('firebase-functions');
 const admin = require('firebase-admin');
 const { Storage } = require('@google-cloud/storage');
+const { PDFDocument } = require('pdf-lib');
 const OpenAI = require('openai');
 
 const app = admin.initializeApp();
@@ -96,6 +97,29 @@ function parseJsonFromResponse(text) {
     if (!match) throw new Error('No JSON found in OCR response');
     return JSON.parse(match[0]);
   }
+}
+
+async function convertBufferToPdf(buffer, mimeType = 'image/jpeg') {
+  if (mimeType === 'application/pdf') {
+    return buffer;
+  }
+
+  const pdfDoc = await PDFDocument.create();
+  let embeddedImage;
+
+  if (mimeType === 'image/png') {
+    embeddedImage = await pdfDoc.embedPng(buffer);
+  } else {
+    // pdf-lib supports JPEG/JPG via embedJpg; fall back to it for other bitmap formats
+    embeddedImage = await pdfDoc.embedJpg(buffer);
+  }
+
+  const { width, height } = embeddedImage;
+  const page = pdfDoc.addPage([width, height]);
+  page.drawImage(embeddedImage, { x: 0, y: 0, width, height });
+
+  const pdfBytes = await pdfDoc.save();
+  return Buffer.from(pdfBytes);
 }
 
 async function runInvoiceOcr(buffer, mimeType) {
@@ -288,11 +312,30 @@ exports.processUploadedInvoice = functions.storage.object().onFinalize(async (ob
     const invoiceId = sanitizeId(uploadId, 'unknown-invoice');
 
     const invoiceDocRef = db.doc(`suppliers/${supplierId}/invoices/${invoiceId}`);
+    const pdfObjectPath = `suppliers/${supplierId}/invoices/${invoiceId}.pdf`;
+
+    // Convert the uploaded file to PDF (if needed) and store alongside the processed invoice
+    try {
+      const pdfBuffer = await convertBufferToPdf(buffer, mimeType);
+      await storage
+        .bucket(bucket)
+        .file(pdfObjectPath)
+        .save(pdfBuffer, {
+          resumable: false,
+          contentType: 'application/pdf',
+          metadata: {
+            originalContentType: mimeType
+          }
+        });
+      console.log(`Stored normalized PDF at gs://${bucket}/${pdfObjectPath}`);
+    } catch (pdfError) {
+      console.error(`Failed to store PDF version of ${objectName}:`, pdfError);
+    }
 
     const invoicePayload = {
       invoiceId,
       rawFilePath: objectName,
-      filePath: `suppliers/${supplierId}/invoices/${invoiceId}.pdf`,
+      filePath: pdfObjectPath,
       uploadedBy,
       supplierId,
       supplierName,
@@ -313,6 +356,7 @@ exports.processUploadedInvoice = functions.storage.object().onFinalize(async (ob
     };
 
     await invoiceDocRef.set(invoicePayload, { merge: true });
+  
     console.log(`Stored invoice data at ${invoiceDocRef.path}`);
   } catch (error) {
     console.error(`Failed to process invoice ${objectName}:`, error);
