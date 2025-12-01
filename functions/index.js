@@ -8,7 +8,6 @@ const app = admin.initializeApp();
 
 const storage = new Storage();
 const db = admin.firestore();
-console.log(`[init] Firestore database set to ${app.options.projectId}/(default)`);
 const DEFAULT_FOLDER = 'invoices';
 const UPLOADS_PREFIX = 'uploads/';
 const REQUIRED_FIELDS = [
