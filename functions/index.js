@@ -1,12 +1,14 @@
 const functions = require('firebase-functions');
 const admin = require('firebase-admin');
 const { Storage } = require('@google-cloud/storage');
+const vision = require('@google-cloud/vision');
 const { PDFDocument } = require('pdf-lib');
 const OpenAI = require('openai');
 
 const app = admin.initializeApp();
 
 const storage = new Storage();
+const visionClient = new vision.ImageAnnotatorClient();
 const db = admin.firestore();
 const DEFAULT_FOLDER = 'invoices';
 const UPLOADS_PREFIX = 'uploads/';
@@ -121,37 +123,58 @@ async function convertBufferToPdf(buffer, mimeType = 'image/jpeg') {
   const pdfBytes = await pdfDoc.save();
   return Buffer.from(pdfBytes);
 }
-
 async function runInvoiceOcr(buffer, mimeType) {
   if (!openaiClient) {
     console.warn('OPENAI_API_KEY not configured; skipping OCR.');
     return null;
   }
 
-  const base64 = buffer.toString('base64');
+  let fullText = '';
+  try {
+    const [visionResult] = await visionClient.documentTextDetection({
+      image: { content: buffer }
+    });
+    fullText = visionResult?.fullTextAnnotation?.text?.trim() || '';
+  } catch (visionError) {
+    console.error(
+      'Vision API failed to read invoice text',
+      { mimeType },
+      visionError
+    );
+    return null;
+  }
+
+  if (!fullText) {
+    console.warn('Vision API did not return any text for this invoice.', { mimeType });
+    return null;
+  }
+
   const systemPrompt = [
     'You are an expert accountant specializing in OCR for European invoices.',
     '',
-    'Your task is to extract fields from invoices that may contain Greek text.',
+    'You will receive the raw Greek text of an invoice that was extracted via OCR.',
     '',
     'IMPORTANT RULES:',
     '1. The supplier/vendor (ΠΡΟΜΗΘΕΥΤΗΣ) is ALWAYS the entity printed at the top of the invoice.',
     '2. The supplier VAT number (ΑΦΜ ΠΡΟΜΗΘΕΥΤΗ) is ALWAYS located near the supplier’s address/logo.',
-    '3. The customer/buyer (ΠΕΛΑΤΗΣ) appears typically under a section titled “ΠΡΟΣ”, “ΠΕΛΑΤΗΣ”, “ΑΠΟΔΕΚΤΗΣ”.',
+    '3. The customer/buyer (ΠΕΛΑΤΗΣ) appears under sections such as “ΠΡΟΣ”, “ΠΕΛΑΤΗΣ”, or “ΑΠΟΔΕΚΤΗΣ”.',
     '4. NEVER confuse the customer with the supplier.',
     '5. If more than one VAT number (ΑΦΜ) is detected, choose the one closest to the supplier section.',
     '6. Extract ONLY the supplier VAT number — NOT the customer VAT number.',
     '',
-    'Respond strictly in JSON.',
+    'Respond strictly in JSON that follows the provided schema.',
     'If a value is missing or uncertain, return null.',
-    'Use dot-decimal notation for amounts (e.g. 1234.56).'
+    'Use dot-decimal notation for all amounts (e.g. 1234.56) and omit currency symbols.'
   ].join('\n');
 
   const extractionPrompt =
-    'Παρακαλώ κάνε OCR στο συνημμένο τιμολόγιο και επέστρεψε τα παρακάτω πεδία στα ελληνικά. ' +
-    'Εκτός από τα αριθμητικά/κειμενικά πεδία, πρόσθεσε και ένα πεδίο «ΑΚΡΙΒΕΙΑ» με ποσοστιαία εκτίμηση (0-100%) ' +
+    'Παρακάτω σου δίνω ΟΛΟ το κείμενο ενός τιμολογίου όπως προέκυψε από OCR. ' +
+    'Παρακαλώ εντόπισε και επέστρεψε τα παρακάτω πεδία στα ελληνικά. ' +
+    'Επιπλέον, πρόσθεσε και ένα πεδίο «ΑΚΡΙΒΕΙΑ» με ποσοστιαία εκτίμηση (0-100%) ' +
     'για το πόσο βέβαιος είσαι ότι όλα τα υπόλοιπα δεδομένα είναι σωστά:\n' +
-    REQUIRED_FIELDS.map((field, idx) => `${idx + 1}. ${field}`).join('\n');
+    REQUIRED_FIELDS.map((field, idx) => `${idx + 1}. ${field}`).join('\n') +
+    '\n\nΑκολουθεί το κείμενο του τιμολογίου:\n\n' +
+    fullText;
 
   const response = await openaiClient.responses.create({
     model: 'gpt-4o-mini',
@@ -163,8 +186,7 @@ async function runInvoiceOcr(buffer, mimeType) {
       {
         role: 'user',
         content: [
-          { type: 'input_text', text: extractionPrompt },
-          { type: 'input_image', image_url: `data:${mimeType};base64,${base64}` }
+          { type: 'input_text', text: extractionPrompt }
         ]
       }
     ],
@@ -237,7 +259,7 @@ exports.getSignedUploadUrl = functions.https.onRequest(async (req, res) => {
   }
 
   const sanitizedFilename = sanitizeFilename(filename);
-  const objectName = `${folder}/${decoded.uid}/${Date.now()}-${sanitizedFilename}`;
+  const objectName = `${folder}/${decoded.uid}/${Date.now()}-${sanitizedFilename}`;//Date and - should be removed
   const expiresAtMs = Date.now() + 15 * 60 * 1000;
 
   try {
