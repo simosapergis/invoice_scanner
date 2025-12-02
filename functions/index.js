@@ -388,4 +388,4 @@ exports.processUploadedInvoice = functions.storage.object().onFinalize(async (ob
   } catch (error) {
     console.error(`Failed to process invoice ${objectName}:`, error);
   }
-  });
+});

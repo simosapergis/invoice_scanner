@@ -7,7 +7,8 @@
     "invoice:ocr": "node invoice_ocr.js",
     "invoice:ocr2": "node invoice_ocr_2.js",
     "auth:login": "node auth_login.js",
-    "signed-url:server": "node signed_url_server.js"
+    "signed-url:server": "node signed_url_server.js",
+    "upload:invoice": "node upload_invoice.js"
   },
   "dependencies": {
     "@google-cloud/storage": "^7.11.1",

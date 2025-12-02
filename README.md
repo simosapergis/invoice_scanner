@@ -17,6 +17,14 @@ export OPENAI_API_KEY=sk-...
 npm run invoice:ocr                 # uses invoice.JPG
 # or OCR a specific file
 node invoice_ocr.js my_invoice.pdf
+
+# One-shot upload (auth → signed URL → PUT)
+export FIREBASE_API_KEY=your-firebase-web-api-key
+export FIREBASE_AUTH_EMAIL=your-user@example.com
+export FIREBASE_AUTH_PASSWORD=super-secret
+export FIREBASE_PROJECT_ID=level-approach-479119-b3          # or set SIGNED_URL_ENDPOINT directly
+export FIREBASE_FUNCTION_REGION=europe-west8                 # default is us-central1
+npm run upload:invoice -- ./invoice.jpg --folder uploads --content-type image/jpeg
 ```
 
 The script uploads the invoice to GPT-4o, performs OCR in Greek, and prints the requested fields plus an `ΑΚΡΙΒΕΙΑ` confidence percentage. Uncomment the schema block in `invoice_ocr.js` if you want to enforce JSON output strictly.
@@ -73,6 +81,14 @@ node invoice_ocr.js .\my_invoice.pdf
 # Firebase email/password login (prints ID token)
 $env:FIREBASE_API_KEY = "your-firebase-web-api-key"
 npm run auth:login
+
+# One-shot upload (auth → signed URL → PUT)
+$env:FIREBASE_API_KEY = "your-firebase-web-api-key"
+$env:FIREBASE_AUTH_EMAIL = "your-user@example.com"
+$env:FIREBASE_AUTH_PASSWORD = "super-secret"
+$env:FIREBASE_PROJECT_ID = "level-approach-479119-b3"   # or set SIGNED_URL_ENDPOINT
+#$env:FIREBASE_FUNCTION_REGION = "europe-west8"
+npm run upload:invoice -- .\invoice.jpg --folder uploads --content-type image/jpeg
 
 # Signed URL server
 $env:FIREBASE_PROJECT_ID = "your-project-id"
