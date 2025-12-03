@@ -44,7 +44,7 @@ function extractBearerToken(headerValue) {
 }
 
 function sanitizeFilename(name) {
-  return name.replace(/[^a-zA-Z0-9._-]/g, '_');
+  return name ? name.replace(/[^a-zA-Z0-9._-]/g, '_') : crypto.randomUUID();
 }
 
 function sanitizeId(value, fallback) {
