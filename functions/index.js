@@ -13,7 +13,8 @@ const visionClient = new vision.ImageAnnotatorClient();
 const db = admin.firestore();
 const DEFAULT_FOLDER = 'invoices';
 const UPLOADS_PREFIX = 'uploads/';
-const INVOICE_COLLECTION = 'invoices';
+const METADATA_INVOICE_COLLECTION = 'metadata_invoices';
+const SERVICE_ACCOUNT_EMAIL = 'mylogia@level-approach-479119-b3.iam.gserviceaccount.com';
 const SIGNED_URL_TTL_MS = 15 * 60 * 1000;
 const INVOICE_STATUS = {
   pending: 'pending',
@@ -117,7 +118,7 @@ function getBucketName() {
 }
 
 function invoiceDocRef(invoiceId) {
-  return db.collection(INVOICE_COLLECTION).doc(invoiceId);
+  return db.collection(METADATA_INVOICE_COLLECTION).doc(invoiceId);
 }
 
 function normalizeInvoiceId(invoiceId) {
@@ -288,7 +289,7 @@ async function registerUploadedPage({
 function parseUploadObjectName(objectName) {
   if (!objectName || !objectName.startsWith(UPLOADS_PREFIX)) {
     return null;
-  }
+}
 
   const remainder = objectName.slice(UPLOADS_PREFIX.length);
   const [invoiceId, rest] = remainder.split('/', 2);
@@ -336,6 +337,7 @@ async function buildCombinedPdfFromPages(pageEntries, defaultBucket) {
   }
 
   const combinedPdf = await PDFDocument.create();
+  const downloadedPages = [];
 
   for (const entry of pageEntries) {
     const bucketName = entry.bucket || defaultBucket;
@@ -349,6 +351,13 @@ async function buildCombinedPdfFromPages(pageEntries, defaultBucket) {
 
     const [buffer] = await storage.bucket(bucketName).file(entry.objectName).download();
     const mimeType = entry.contentType || 'application/octet-stream';
+    downloadedPages.push({
+      pageNumber: entry.pageNumber,
+      buffer,
+      mimeType,
+      objectName: entry.objectName,
+      bucketName
+    });
 
     if (mimeType === 'application/pdf') {
       const pdfDoc = await PDFDocument.load(buffer);
@@ -365,31 +374,53 @@ async function buildCombinedPdfFromPages(pageEntries, defaultBucket) {
   }
 
   const combinedBuffer = await combinedPdf.save();
-  return Buffer.from(combinedBuffer);
+  return {
+    combinedPdfBuffer: Buffer.from(combinedBuffer),
+    downloadedPages
+  };
 }
-async function runInvoiceOcr(buffer, mimeType) {
+
+async function runInvoiceOcr(pageBuffers) {
   if (!openaiClient) {
     console.warn('OPENAI_API_KEY not configured; skipping OCR.');
     return null;
   }
 
-  let fullText = '';
-  try {
-    const [visionResult] = await visionClient.documentTextDetection({
-      image: { content: buffer }
-    });
-    fullText = visionResult?.fullTextAnnotation?.text?.trim() || '';
-  } catch (visionError) {
-    console.error(
-      'Vision API failed to read invoice text',
-      { mimeType },
-      visionError
-    );
+  if (!Array.isArray(pageBuffers) || !pageBuffers.length) {
+    console.warn('No page buffers provided for OCR.');
     return null;
   }
 
+  const aggregatedText = [];
+  for (const page of pageBuffers) {
+    const mimeType = page.mimeType || 'application/octet-stream';
+    if (mimeType === 'application/pdf') {
+      console.warn(
+        `Skipping PDF page ${page.pageNumber} for Vision OCR; expected image formats.`,
+        { mimeType }
+      );
+      continue;
+    }
+
+    try {
+      const [visionResult] = await visionClient.documentTextDetection({
+        image: { content: page.buffer }
+      });
+      const pageText = visionResult?.fullTextAnnotation?.text?.trim();
+      if (pageText) {
+        aggregatedText.push(`--- page ${page.pageNumber} ---\n${pageText}`);
+      } else {
+        console.warn(`Vision returned empty text for page ${page.pageNumber}`);
+      }
+    } catch (visionError) {
+      console.error('Vision API failed to read invoice text', { mimeType }, visionError);
+      return null;
+    }
+  }
+
+  const fullText = aggregatedText.join('\n\n');
   if (!fullText) {
-    console.warn('Vision API did not return any text for this invoice.', { mimeType });
+    console.warn('Vision API did not return any text for this invoice.');
     return null;
   }
 
@@ -464,7 +495,9 @@ async function runInvoiceOcr(buffer, mimeType) {
 }
 
 //exports.getSignedUploadUrl = functions.region('europe-west8').https.onRequest(async (req, res) => {
-exports.getSignedUploadUrl = functions.https.onRequest(async (req, res) => {
+exports.getSignedUploadUrl = functions
+  .runWith({ serviceAccount: SERVICE_ACCOUNT_EMAIL })
+  .https.onRequest(async (req, res) => {
   res.set('Access-Control-Allow-Origin', '*');
   res.set('Access-Control-Allow-Headers', 'Authorization, Content-Type');
   res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
@@ -555,7 +588,10 @@ exports.getSignedUploadUrl = functions.https.onRequest(async (req, res) => {
   }
 });
 
-exports.processUploadedInvoice = functions.storage.object().onFinalize(async (object) => {
+exports.processUploadedInvoice = functions
+  .runWith({ serviceAccount: SERVICE_ACCOUNT_EMAIL })
+  .storage.object()
+  .onFinalize(async (object) => {
   const { name: objectName, bucket, contentType } = object;
   if (!objectName) {
     console.warn('Finalize event missing object name');
@@ -592,8 +628,9 @@ exports.processUploadedInvoice = functions.storage.object().onFinalize(async (ob
   }
 });
 
-exports.processInvoiceDocument = functions.firestore
-  .document(`${INVOICE_COLLECTION}/{invoiceId}`)
+exports.processInvoiceDocument = functions
+  .runWith({ serviceAccount: SERVICE_ACCOUNT_EMAIL })
+  .firestore.document(`${METADATA_INVOICE_COLLECTION}/{invoiceId}`)
   .onWrite(async (change, context) => {
     const after = change.after.exists ? change.after.data() : null;
     if (!after) {
@@ -681,8 +718,11 @@ exports.processInvoiceDocument = functions.firestore
     }
 
     try {
-      const combinedPdfBuffer = await buildCombinedPdfFromPages(pages, bucketName);
-      const ocrResult = await runInvoiceOcr(combinedPdfBuffer, 'application/pdf');
+      const { combinedPdfBuffer, downloadedPages } = await buildCombinedPdfFromPages(
+        pages,
+        bucketName
+      );
+      const ocrResult = await runInvoiceOcr(downloadedPages);
       if (!ocrResult) {
         throw new Error('OCR result was empty.');
       }
