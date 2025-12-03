@@ -5,7 +5,6 @@ import path from "path";
 import process from "process";
 import crypto from "crypto";
 
-const DEFAULT_FOLDER = "uploads";
 const REQUIRED_ENV_VARS = [
   "FIREBASE_API_KEY",
   "FIREBASE_AUTH_EMAIL",
@@ -109,17 +108,21 @@ function buildFilename(filePath, cliOverride) {
 }
 
 function parseArgs(argv) {
-  const args = { folder: DEFAULT_FOLDER };
+  const args = {};
   const positional = [];
 
   for (let i = 0; i < argv.length; i += 1) {
     const current = argv[i];
-    if (current === "--folder" && argv[i + 1]) {
-      args.folder = argv[++i];
-    } else if (current === "--filename" && argv[i + 1]) {
+    if (current === "--filename" && argv[i + 1]) {
       args.filename = argv[++i];
     } else if (current === "--content-type" && argv[i + 1]) {
       args.contentType = argv[++i];
+    } else if (current === "--invoice-id" && argv[i + 1]) {
+      args.invoiceId = argv[++i];
+    } else if (current === "--page" && argv[i + 1]) {
+      args.pageNumber = Number(argv[++i]);
+    } else if (current === "--total-pages" && argv[i + 1]) {
+      args.totalPages = Number(argv[++i]);
     } else if (current === "--function-url" && argv[i + 1]) {
       args.functionUrl = argv[++i];
     } else if (current === "--help" || current === "-h") {
@@ -178,10 +181,12 @@ async function uploadToSignedUrl(uploadUrl, buffer, contentType) {
 }
 
 function printUsage() {
-  console.log(`Usage: node upload_invoice.js <file-path> [options]
+  console.log(`Usage: node upload_invoice.js <file-path> --page <n> [options]
 
 Options:
-  --folder <name>          Destination folder prefix in Storage (default: ${DEFAULT_FOLDER})
+  --page <number>          (required) Page index for this upload (1-based)
+  --total-pages <number>   Required when creating a new invoice (no --invoice-id yet)
+  --invoice-id <uuid>      Reuse an existing invoice session
   --filename <name>        Override the filename sent to the signing endpoint
   --content-type <type>    Explicit MIME type (auto-detected from extension otherwise)
   --function-url <url>     Override the getSignedUploadUrl endpoint
@@ -209,13 +214,24 @@ async function main() {
     ensureEnv(envName);
   }
 
+  if (!Number.isInteger(args.pageNumber) || args.pageNumber <= 0) {
+    throw new Error("--page must be a positive integer (e.g. 1, 2, 3).");
+  }
+
+  const hasTotalPages = Number.isInteger(args.totalPages) && args.totalPages > 0;
+  if (!args.invoiceId && !hasTotalPages) {
+    throw new Error(
+      "Provide --total-pages when creating a new invoice (when --invoice-id is omitted)."
+    );
+  }
+
   const absolutePath = path.resolve(process.cwd(), args.filePath);
   const fileBuffer = await fs.readFile(absolutePath);
 
   const contentType = guessContentType(absolutePath, args.contentType);
   const filename = buildFilename(absolutePath, args.filename);
-  const folder = args.folder || DEFAULT_FOLDER;
   const functionUrl = getFunctionUrl(args.functionUrl);
+  const totalPagesPayload = hasTotalPages ? args.totalPages : undefined;
 
   console.log("1/4 Authenticating with Firebase...");
   const { idToken, expiresIn } = await signInWithEmailPassword(
@@ -229,9 +245,17 @@ async function main() {
   const signedUrlResponse = await requestSignedUrl(functionUrl, idToken, {
     filename,
     contentType,
-    folder
+    invoiceId: args.invoiceId,
+    pageNumber: args.pageNumber,
+    totalPages: totalPagesPayload
   });
-  console.log("   ✅ Signed URL created for %s", signedUrlResponse.objectName);
+  const resolvedInvoiceId = signedUrlResponse.invoiceId;
+  console.log(
+    "   ✅ Signed URL created for invoice %s (page %s of %s)",
+    resolvedInvoiceId,
+    signedUrlResponse.pageNumber,
+    signedUrlResponse.totalPages ?? "?"
+  );
 
   console.log("3/4 Uploading file to signed URL...");
   await uploadToSignedUrl(signedUrlResponse.uploadUrl, fileBuffer, contentType);
@@ -241,6 +265,12 @@ async function main() {
   console.log("   Bucket:      %s", signedUrlResponse.bucket);
   console.log("   Object name: %s", signedUrlResponse.objectName);
   console.log("   ContentType: %s", contentType);
+  console.log("   Invoice ID:  %s", resolvedInvoiceId);
+  console.log(
+    "   Page:        %s / %s",
+    signedUrlResponse.pageNumber,
+    signedUrlResponse.totalPages ?? "?"
+  );
   console.log("   Signed URL expires at: %s", signedUrlResponse.expiresAt);
 }
 

@@ -4,6 +4,7 @@ const { Storage } = require('@google-cloud/storage');
 const vision = require('@google-cloud/vision');
 const { PDFDocument } = require('pdf-lib');
 const OpenAI = require('openai');
+const crypto = require('crypto');
 
 const app = admin.initializeApp();
 
@@ -12,6 +13,16 @@ const visionClient = new vision.ImageAnnotatorClient();
 const db = admin.firestore();
 const DEFAULT_FOLDER = 'invoices';
 const UPLOADS_PREFIX = 'uploads/';
+const INVOICE_COLLECTION = 'invoices';
+const SIGNED_URL_TTL_MS = 15 * 60 * 1000;
+const INVOICE_STATUS = {
+  pending: 'pending',
+  ready: 'ready',
+  processing: 'processing',
+  done: 'done',
+  error: 'error'
+};
+const serverTimestamp = admin.firestore.FieldValue.serverTimestamp;
 const REQUIRED_FIELDS = [
   'ΗΜΕΡΟΜΗΝΙΑ',
   'ΑΡΙΘΜΟΣ ΤΙΜΟΛΟΓΙΟΥ',
@@ -101,6 +112,201 @@ function parseJsonFromResponse(text) {
   }
 }
 
+function getBucketName() {
+  return process.env.GCS_BUCKET || functions.config().uploads?.bucket;
+}
+
+function invoiceDocRef(invoiceId) {
+  return db.collection(INVOICE_COLLECTION).doc(invoiceId);
+}
+
+function normalizeInvoiceId(invoiceId) {
+  return invoiceId || crypto.randomUUID();
+}
+
+function normalizeTotalPages(totalPages) {
+  if (totalPages === undefined || totalPages === null) return null;
+  const value = Number(totalPages);
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error('totalPages must be a positive integer');
+  }
+  return value;
+}
+
+function normalizePageNumber(pageNumber) {
+  const value = Number(pageNumber);
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error('pageNumber must be a positive integer');
+  }
+  return value;
+}
+
+function padPageNumber(pageNumber) {
+  return String(pageNumber).padStart(3, '0');
+}
+
+async function ensureInvoiceDocument({ invoiceId, uid, bucketName, totalPages }) {
+  const resolvedInvoiceId = normalizeInvoiceId(invoiceId);
+  const normalizedTotalPages = normalizeTotalPages(totalPages);
+  const docRef = invoiceDocRef(resolvedInvoiceId);
+
+  const metadata = await db.runTransaction(async (tx) => {
+    const snap = await tx.get(docRef);
+    if (!snap.exists) {
+      if (normalizedTotalPages === null) {
+        throw new Error('totalPages must be provided when starting a new invoice.');
+      }
+
+      tx.set(docRef, {
+        invoiceId: resolvedInvoiceId,
+        ownerUid: uid,
+        bucket: bucketName,
+        storageFolder: `${UPLOADS_PREFIX}${resolvedInvoiceId}`,
+        status: INVOICE_STATUS.pending,
+        totalPages: normalizedTotalPages,
+        uploadedPages: [],
+        uploadedCount: 0,
+        pages: [],
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp()
+      });
+
+      return {
+        invoiceId: resolvedInvoiceId,
+        totalPages: normalizedTotalPages,
+        bucket: bucketName,
+        status: INVOICE_STATUS.pending
+      };
+    }
+
+    const existing = snap.data();
+    if (
+      existing.totalPages &&
+      normalizedTotalPages &&
+      existing.totalPages !== normalizedTotalPages
+    ) {
+      throw new Error('totalPages does not match the existing invoice metadata');
+    }
+
+    tx.update(docRef, {
+      totalPages: existing.totalPages || normalizedTotalPages || null,
+      bucket: existing.bucket || bucketName,
+      ownerUid: existing.ownerUid || uid,
+      updatedAt: serverTimestamp()
+    });
+
+    return {
+      ...existing,
+      invoiceId: resolvedInvoiceId,
+      totalPages: existing.totalPages || normalizedTotalPages || null,
+      bucket: existing.bucket || bucketName,
+      status: existing.status || INVOICE_STATUS.pending
+    };
+  });
+
+  return metadata;
+}
+
+async function registerUploadedPage({
+  invoiceId,
+  pageNumber,
+  objectName,
+  bucketName,
+  contentType,
+  totalPages,
+  uid
+}) {
+  const normalizedPageNumber = normalizePageNumber(pageNumber);
+  const normalizedTotalPages = normalizeTotalPages(totalPages);
+  const docRef = invoiceDocRef(invoiceId);
+
+  const result = await db.runTransaction(async (tx) => {
+    const snap = await tx.get(docRef);
+    if (!snap.exists) {
+      throw new Error(`Invoice ${invoiceId} metadata not found`);
+    }
+
+    const data = snap.data();
+    if (data.ownerUid && uid && data.ownerUid !== uid) {
+      throw new Error('You do not have access to this invoice.');
+    }
+
+    const resolvedTotalPages = data.totalPages || normalizedTotalPages;
+    if (!resolvedTotalPages) {
+      throw new Error('totalPages must be specified before uploading pages');
+    }
+
+    if (normalizedTotalPages && resolvedTotalPages !== normalizedTotalPages) {
+      throw new Error('totalPages does not match existing metadata');
+    }
+
+    if (normalizedPageNumber > resolvedTotalPages) {
+      throw new Error('pageNumber cannot exceed totalPages');
+    }
+
+    const uploadedPages = new Set(Array.isArray(data.uploadedPages) ? data.uploadedPages : []);
+    uploadedPages.add(normalizedPageNumber);
+
+    const pages = Array.isArray(data.pages)
+      ? data.pages.filter((entry) => entry?.pageNumber !== normalizedPageNumber)
+      : [];
+    pages.push({
+      pageNumber: normalizedPageNumber,
+      objectName,
+      bucket: bucketName,
+      contentType: contentType || 'application/octet-stream',
+      recordedAt: admin.firestore.Timestamp.now()
+    });
+    pages.sort((a, b) => a.pageNumber - b.pageNumber);
+
+    const shouldMarkReady =
+      uploadedPages.size === resolvedTotalPages && data.status === INVOICE_STATUS.pending;
+
+    tx.update(docRef, {
+      totalPages: resolvedTotalPages,
+      uploadedPages: Array.from(uploadedPages).sort((a, b) => a - b),
+      uploadedCount: uploadedPages.size,
+      pages,
+      bucket: bucketName || data.bucket,
+      ownerUid: data.ownerUid || uid,
+      status: shouldMarkReady ? INVOICE_STATUS.ready : data.status,
+      readyAt: shouldMarkReady ? serverTimestamp() : data.readyAt || null,
+      updatedAt: serverTimestamp()
+    });
+
+    return {
+      invoiceId,
+      status: shouldMarkReady ? INVOICE_STATUS.ready : data.status,
+      uploadedPages: Array.from(uploadedPages),
+      totalPages: resolvedTotalPages
+    };
+  });
+
+  return result;
+}
+
+function parseUploadObjectName(objectName) {
+  if (!objectName || !objectName.startsWith(UPLOADS_PREFIX)) {
+    return null;
+  }
+
+  const remainder = objectName.slice(UPLOADS_PREFIX.length);
+  const [invoiceId, rest] = remainder.split('/', 2);
+  if (!invoiceId || !rest) return null;
+
+  const pageMatch = rest.match(/^page-(\d{1,4})-/i);
+  if (!pageMatch) return null;
+
+  const pageNumber = Number(pageMatch[1]);
+  const originalFilename = rest.slice(pageMatch[0].length);
+
+  return {
+    invoiceId,
+    pageNumber,
+    originalFilename
+  };
+}
+
 async function convertBufferToPdf(buffer, mimeType = 'image/jpeg') {
   if (mimeType === 'application/pdf') {
     return buffer;
@@ -122,6 +328,44 @@ async function convertBufferToPdf(buffer, mimeType = 'image/jpeg') {
 
   const pdfBytes = await pdfDoc.save();
   return Buffer.from(pdfBytes);
+}
+
+async function buildCombinedPdfFromPages(pageEntries, defaultBucket) {
+  if (!Array.isArray(pageEntries) || pageEntries.length === 0) {
+    throw new Error('No invoice pages were provided for OCR.');
+  }
+
+  const combinedPdf = await PDFDocument.create();
+
+  for (const entry of pageEntries) {
+    const bucketName = entry.bucket || defaultBucket;
+    if (!bucketName) {
+      throw new Error(`Missing bucket configuration for page ${entry.pageNumber}`);
+    }
+
+    if (!entry.objectName) {
+      throw new Error(`Missing object name for page ${entry.pageNumber}`);
+    }
+
+    const [buffer] = await storage.bucket(bucketName).file(entry.objectName).download();
+    const mimeType = entry.contentType || 'application/octet-stream';
+
+    if (mimeType === 'application/pdf') {
+      const pdfDoc = await PDFDocument.load(buffer);
+      const pageIndices = Array.from({ length: pdfDoc.getPageCount() }, (_, index) => index);
+      const copiedPages = await combinedPdf.copyPages(pdfDoc, pageIndices);
+      copiedPages.forEach((page) => combinedPdf.addPage(page));
+      continue;
+    }
+
+    const singlePagePdfBuffer = await convertBufferToPdf(buffer, mimeType);
+    const singlePageDoc = await PDFDocument.load(singlePagePdfBuffer);
+    const [copiedPage] = await combinedPdf.copyPages(singlePageDoc, [0]);
+    combinedPdf.addPage(copiedPage);
+  }
+
+  const combinedBuffer = await combinedPdf.save();
+  return Buffer.from(combinedBuffer);
 }
 async function runInvoiceOcr(buffer, mimeType) {
   if (!openaiClient) {
@@ -233,7 +477,7 @@ exports.getSignedUploadUrl = functions.https.onRequest(async (req, res) => {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  const bucketName = process.env.GCS_BUCKET || functions.config().uploads?.bucket;
+  const bucketName = getBucketName();
   if (!bucketName) {
     return res.status(500).json({ error: 'Missing GCS bucket configuration' });
   }
@@ -253,16 +497,38 @@ exports.getSignedUploadUrl = functions.https.onRequest(async (req, res) => {
     });
   }
 
-  const { filename, contentType = 'application/octet-stream', folder = DEFAULT_FOLDER } = req.body || {};
+  const {
+    filename,
+    contentType = 'application/octet-stream',
+    invoiceId,
+    pageNumber,
+    totalPages = null
+  } = req.body || {};
+
   if (!filename) {
     return res.status(400).json({ error: 'filename is required in the request body' });
   }
 
-  const sanitizedFilename = sanitizeFilename(filename);
-  const objectName = `${folder}/${decoded.uid}/${Date.now()}-${sanitizedFilename}`;//Date and - should be removed
-  const expiresAtMs = Date.now() + 15 * 60 * 1000;
-
   try {
+    const normalizedTotalPages = normalizeTotalPages(totalPages);
+    const normalizedPageNumber = normalizePageNumber(pageNumber);
+    const sanitizedFilename = sanitizeFilename(filename);
+    const invoiceMetadata = await ensureInvoiceDocument({
+      invoiceId,
+      uid: decoded.uid,
+      bucketName,
+      totalPages: normalizedTotalPages
+    });
+    const resolvedInvoiceId = invoiceMetadata.invoiceId;
+    const resolvedTotalPages = invoiceMetadata.totalPages || normalizedTotalPages;
+    if (!resolvedTotalPages) {
+      throw new Error('totalPages must be specified for the invoice');
+    }
+    const objectName = `${UPLOADS_PREFIX}${resolvedInvoiceId}/page-${padPageNumber(
+      normalizedPageNumber
+    )}-${sanitizedFilename}`;
+    const expiresAtMs = Date.now() + SIGNED_URL_TTL_MS;
+
     const [signedUrl] = await storage
       .bucket(bucketName)
       .file(objectName)
@@ -274,6 +540,9 @@ exports.getSignedUploadUrl = functions.https.onRequest(async (req, res) => {
       });
 
     return res.json({
+      invoiceId: resolvedInvoiceId,
+      pageNumber: normalizedPageNumber,
+      totalPages: resolvedTotalPages,
       uploadUrl: signedUrl,
       bucket: bucketName,
       objectName,
@@ -282,7 +551,7 @@ exports.getSignedUploadUrl = functions.https.onRequest(async (req, res) => {
     });
   } catch (error) {
     console.error('Failed to create signed URL:', error);
-    return res.status(500).json({ error: 'Failed to create signed URL' });
+    return res.status(400).json({ error: error.message });
   }
 });
 
@@ -298,94 +567,206 @@ exports.processUploadedInvoice = functions.storage.object().onFinalize(async (ob
     return;
   }
 
-  if (!openaiClient) {
-    console.warn('Skipping OCR because OPENAI_API_KEY is not configured.');
+  const parsed = parseUploadObjectName(objectName);
+  if (!parsed) {
+    console.warn(`Unable to parse invoice metadata from object name: ${objectName}`);
     return;
   }
 
   try {
-    console.log(`Processing uploaded invoice: gs://${bucket}/${objectName}`);
-    const [buffer] = await storage.bucket(bucket).file(objectName).download();
-    const mimeType = contentType || 'application/octet-stream';
+    await registerUploadedPage({
+      invoiceId: parsed.invoiceId,
+      pageNumber: parsed.pageNumber,
+      objectName,
+      bucketName: bucket,
+      contentType: contentType || 'application/octet-stream'
+    });
+    console.log(
+      `Registered page ${parsed.pageNumber} for invoice ${parsed.invoiceId} (${objectName})`
+    );
+  } catch (error) {
+    console.error(
+      `Failed to register page ${parsed.pageNumber} for invoice ${parsed.invoiceId}`,
+      error
+    );
+  }
+});
 
-    const ocrResult = await runInvoiceOcr(buffer, mimeType);
-    if (!ocrResult) {
-      console.warn('OCR result was empty.');
+exports.processInvoiceDocument = functions.firestore
+  .document(`${INVOICE_COLLECTION}/{invoiceId}`)
+  .onWrite(async (change, context) => {
+    const after = change.after.exists ? change.after.data() : null;
+    if (!after) {
       return;
     }
 
-    const mappedResult = Object.entries(ocrResult).reduce((acc, [key, value]) => {
-      const englishKey = FIELD_LABELS[key] || key;
-      acc[englishKey] = value;
-      return acc;
-    }, {});
-
-    console.log('OCR extraction (GR):', JSON.stringify(ocrResult, null, 2));
-    console.log('OCR extraction (EN):', JSON.stringify(mappedResult, null, 2));
-
-    const pathParts = objectName.split('/');
-    const fileBase = pathParts[pathParts.length - 1] || '';
-    const uploadId = pathParts.length >= 2 ? pathParts[1] : fileBase.split('.')[0];
-    const uploadedBy = null;
-
-    const supplierName = mappedResult.supplierName || 'Unknown Supplier';
-    const supplierTaxNumber = mappedResult.supplierTaxNumber || null;
-    const supplierId = sanitizeId(
-      supplierTaxNumber,
-      sanitizeId(supplierName, 'unknown-supplier')
-    );
-    const invoiceNumber =
-      mappedResult.invoiceNumber?.toString().match(/\d+/g)?.join('') || null;
-    const invoiceId = sanitizeId(uploadId, 'unknown-invoice');
-
-    const invoiceDocRef = db.doc(`suppliers/${supplierId}/invoices/${invoiceId}`);
-    const pdfObjectPath = `suppliers/${supplierId}/invoices/${invoiceId}.pdf`;
-
-    // Convert the uploaded file to PDF (if needed) and store alongside the processed invoice
-    try {
-      const pdfBuffer = await convertBufferToPdf(buffer, mimeType);
-      await storage
-        .bucket(bucket)
-        .file(pdfObjectPath)
-        .save(pdfBuffer, {
-          resumable: false,
-          contentType: 'application/pdf',
-          metadata: {
-            originalContentType: mimeType
-          }
-        });
-      console.log(`Stored normalized PDF at gs://${bucket}/${pdfObjectPath}`);
-    } catch (pdfError) {
-      console.error(`Failed to store PDF version of ${objectName}:`, pdfError);
+    const before = change.before.exists ? change.before.data() : null;
+    if (before && before.status === after.status) {
+      return;
     }
 
-    const invoicePayload = {
-      invoiceId,
-      rawFilePath: objectName,
-      filePath: pdfObjectPath,
-      uploadedBy,
-      supplierId,
-      supplierName,
-      supplierTaxNumber,
-      invoiceNumber,
-      invoiceDate: parseDate(mappedResult.invoiceDate),
-      dueDate: parseDate(mappedResult.dueDate),
-      totalAmount: parseAmount(mappedResult.totalAmount),
-      currency: mappedResult.currency || 'EUR',
-      subtotal: parseAmount(mappedResult.subtotal),
-      vatAmount: parseAmount(mappedResult.vat),
-      vatRate: parseAmount(mappedResult.vatRate),
-      status: 'completed',
-      errorMessage: null,
-      confidence: mappedResult.confidence ? Number(mappedResult.confidence) : null,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      processedAt: admin.firestore.FieldValue.serverTimestamp()
-    };
+    if (after.status !== INVOICE_STATUS.ready) {
+      return;
+    }
 
-    await invoiceDocRef.set(invoicePayload, { merge: true });
-  
-    console.log(`Stored invoice data at ${invoiceDocRef.path}`);
-  } catch (error) {
-    console.error(`Failed to process invoice ${objectName}:`, error);
-  }
-});
+    if (!openaiClient) {
+      console.warn('OPENAI_API_KEY not configured; unable to run OCR.');
+      await change.after.ref.update({
+        status: INVOICE_STATUS.error,
+        errorMessage: 'OCR is disabled because OPENAI_API_KEY is missing.',
+        updatedAt: serverTimestamp()
+      });
+      return;
+    }
+
+    let lockedSnapshot;
+    try {
+      lockedSnapshot = await db.runTransaction(async (tx) => {
+        const lockedSnap = await tx.get(change.after.ref);
+        const lockedData = lockedSnap.data();
+        if (lockedData.status !== INVOICE_STATUS.ready) {
+          return null;
+        }
+
+        tx.update(change.after.ref, {
+          status: INVOICE_STATUS.processing,
+          processingStartedAt: serverTimestamp(),
+          errorMessage: null,
+          updatedAt: serverTimestamp()
+        });
+
+        return lockedData;
+      });
+    } catch (error) {
+      console.error('Failed to lock invoice document for processing', error);
+      return;
+    }
+
+    if (!lockedSnapshot) {
+      return;
+    }
+
+    const invoiceId = context.params.invoiceId;
+    const invoiceData = lockedSnapshot;
+    const bucketName = invoiceData.bucket || getBucketName();
+    if (!bucketName) {
+      await change.after.ref.update({
+        status: INVOICE_STATUS.error,
+        errorMessage: 'Missing bucket configuration for invoice processing.',
+        updatedAt: serverTimestamp()
+      });
+      return;
+    }
+
+    const pages = Array.isArray(invoiceData.pages)
+      ? [...invoiceData.pages].sort((a, b) => a.pageNumber - b.pageNumber)
+      : [];
+
+    if (!pages.length) {
+      await change.after.ref.update({
+        status: INVOICE_STATUS.error,
+        errorMessage: 'No pages were uploaded for this invoice.',
+        updatedAt: serverTimestamp()
+      });
+      return;
+    }
+
+    if (invoiceData.totalPages && pages.length !== invoiceData.totalPages) {
+      await change.after.ref.update({
+        status: INVOICE_STATUS.error,
+        errorMessage: `Expected ${invoiceData.totalPages} pages but found ${pages.length}.`,
+        updatedAt: serverTimestamp()
+      });
+      return;
+    }
+
+    try {
+      const combinedPdfBuffer = await buildCombinedPdfFromPages(pages, bucketName);
+      const ocrResult = await runInvoiceOcr(combinedPdfBuffer, 'application/pdf');
+      if (!ocrResult) {
+        throw new Error('OCR result was empty.');
+      }
+
+      const mappedResult = Object.entries(ocrResult).reduce((acc, [key, value]) => {
+        const englishKey = FIELD_LABELS[key] || key;
+        acc[englishKey] = value;
+        return acc;
+      }, {});
+
+      console.log('OCR extraction (GR):', JSON.stringify(ocrResult, null, 2));
+      console.log('OCR extraction (EN):', JSON.stringify(mappedResult, null, 2));
+
+      const supplierName = mappedResult.supplierName || 'Unknown Supplier';
+      const supplierTaxNumber = mappedResult.supplierTaxNumber || null;
+      const supplierId = sanitizeId(
+        supplierTaxNumber,
+        sanitizeId(supplierName, 'unknown-supplier')
+      );
+      const invoiceNumber =
+        mappedResult.invoiceNumber?.toString().match(/\d+/g)?.join('') || null;
+      const uploadedBy = invoiceData.ownerUid || null;
+
+      const pdfObjectPath = `suppliers/${supplierId}/invoices/${invoiceId}.pdf`;
+      try {
+        await storage
+          .bucket(bucketName)
+          .file(pdfObjectPath)
+          .save(combinedPdfBuffer, {
+            resumable: false,
+            contentType: 'application/pdf',
+            metadata: {
+              pages: pages.length,
+              originalFolder: invoiceData.storageFolder || `${UPLOADS_PREFIX}${invoiceId}`
+            }
+          });
+        console.log(`Stored normalized PDF at gs://${bucketName}/${pdfObjectPath}`);
+      } catch (pdfError) {
+        console.error(`Failed to store combined PDF for invoice ${invoiceId}:`, pdfError);
+      }
+
+      const invoiceDocRef = db.doc(`suppliers/${supplierId}/invoices/${invoiceId}`);
+      const invoicePayload = {
+        invoiceId,
+        rawFilePaths: pages.map((p) => p.objectName),
+        filePath: pdfObjectPath,
+        bucket: bucketName,
+        uploadedBy,
+        supplierId,
+        supplierName,
+        supplierTaxNumber,
+        invoiceNumber,
+        invoiceDate: parseDate(mappedResult.invoiceDate),
+        dueDate: parseDate(mappedResult.dueDate),
+        totalAmount: parseAmount(mappedResult.totalAmount),
+        currency: mappedResult.currency || 'EUR',
+        subtotal: parseAmount(mappedResult.subtotal),
+        vatAmount: parseAmount(mappedResult.vat),
+        vatRate: parseAmount(mappedResult.vatRate),
+        status: 'completed',
+        errorMessage: null,
+        confidence: mappedResult.confidence ? Number(mappedResult.confidence) : null,
+        createdAt: invoiceData.createdAt || serverTimestamp(),
+        processedAt: serverTimestamp()
+      };
+
+      await invoiceDocRef.set(invoicePayload, { merge: true });
+
+      await change.after.ref.update({
+        status: INVOICE_STATUS.done,
+        processedAt: serverTimestamp(),
+        processedInvoicePath: invoiceDocRef.path,
+        confidence: invoicePayload.confidence,
+        errorMessage: null,
+        updatedAt: serverTimestamp()
+      });
+
+      console.log(`Stored invoice data at ${invoiceDocRef.path}`);
+    } catch (error) {
+      console.error(`Failed to process invoice ${invoiceId}:`, error);
+      await change.after.ref.update({
+        status: INVOICE_STATUS.error,
+        errorMessage: error.message,
+        updatedAt: serverTimestamp()
+      });
+    }
+  });
