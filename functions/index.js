@@ -31,7 +31,7 @@ const REQUIRED_FIELDS = [
   'ΑΦΜ ΠΡΟΜΗΘΕΥΤΗ',
   'ΣΥΝΟΛΟ ΧΩΡΙΣ ΦΠΑ',
   'ΦΠΑ',
-  'ΤΕΛΙΚΟ ΠΟΣΟ',
+  'ΠΛΗΡΩΤΕΟ',
   'ΑΚΡΙΒΕΙΑ'
 ];
 
@@ -42,7 +42,7 @@ const FIELD_LABELS = {
   'ΑΦΜ ΠΡΟΜΗΘΕΥΤΗ': 'supplierTaxNumber',
   'ΣΥΝΟΛΟ ΧΩΡΙΣ ΦΠΑ': 'subtotal',
   'ΦΠΑ': 'vat',
-  'ΤΕΛΙΚΟ ΠΟΣΟ': 'totalAmount',
+  'ΠΛΗΡΩΤΕΟ': 'totalAmount',
   'ΑΚΡΙΒΕΙΑ': 'confidence'
 };
 
@@ -436,6 +436,7 @@ async function runInvoiceOcr(pageBuffers) {
     '4. NEVER confuse the customer with the supplier.',
     '5. If more than one VAT number (ΑΦΜ) is detected, choose the one closest to the supplier section.',
     '6. Extract ONLY the supplier VAT number — NOT the customer VAT number.',
+    '7. The final amount (ΠΛΗΡΩΤΕΟ) sits at the bottom of the last page, labeled "ΠΛΗΡΩΤΕΟ" or "ΣΥΝΟΛΟ" or "ΤΕΛΙΚΟ"',
     '',
     'Respond strictly in JSON that follows the provided schema.',
     'If a value is missing or uncertain, return null.',
@@ -479,7 +480,7 @@ async function runInvoiceOcr(pageBuffers) {
             'ΠΡΟΜΗΘΕΥΤΗΣ': { type: ['string', 'null'] },
             'ΣΥΝΟΛΟ ΧΩΡΙΣ ΦΠΑ': { type: ['string', 'null'] },
             'ΦΠΑ': { type: ['string', 'null'] },
-            'ΤΕΛΙΚΟ ΠΟΣΟ': { type: ['string', 'null'] },
+            'ΠΛΗΡΩΤΕΟ': { type: ['string', 'null'] },
             'ΑΚΡΙΒΕΙΑ': { type: ['string', 'null'] }
           },
           required: REQUIRED_FIELDS
