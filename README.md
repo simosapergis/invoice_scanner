@@ -113,5 +113,9 @@ npm run signed-url:server
 
 # Cloud Function config (one-time)
 firebase functions:config:set uploads.bucket="your-upload-bucket"
+
+# Deploy all functions (whole index.js)
+firebase deploy --only functions --project level-approach-479119-b3
+# Deploy specific function (e.g getSignedUploadUrl)
 firebase deploy --only functions:getSignedUploadUrl
 ```

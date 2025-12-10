@@ -11,7 +11,6 @@ const app = admin.initializeApp();
 const storage = new Storage();
 const visionClient = new vision.ImageAnnotatorClient();
 const db = admin.firestore();
-const DEFAULT_FOLDER = 'invoices';
 const UPLOADS_PREFIX = 'uploads/';
 const METADATA_INVOICE_COLLECTION = 'metadata_invoices';
 const SERVICE_ACCOUNT_EMAIL = 'mylogia@level-approach-479119-b3.iam.gserviceaccount.com';
@@ -21,7 +20,13 @@ const INVOICE_STATUS = {
   ready: 'ready',
   processing: 'processing',
   done: 'done',
+  uploaded: 'uploaded',
   error: 'error'
+};
+const PAYMENT_STATUS = {
+  unpaid: 'unpaid',
+  paid: 'paid',
+  partiallyPaid: 'partiallyPaid'
 };
 const serverTimestamp = admin.firestore.FieldValue.serverTimestamp;
 const REQUIRED_FIELDS = [
@@ -82,6 +87,55 @@ function parseDate(value) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return null;
   return admin.firestore.Timestamp.fromDate(date);
+}
+
+async function ensureSupplierProfile({
+  supplierId,
+  supplierName,
+  supplierTaxNumber,
+  supplierCategory
+}) {
+  if (!supplierId) {
+    console.warn('Missing supplierId; skipping supplier profile update.');
+    return;
+  }
+
+  const supplierRef = db.doc(`suppliers/${supplierId}`);
+
+  try {
+    await db.runTransaction(async (tx) => {
+      const snap = await tx.get(supplierRef);
+      if (!snap.exists) {
+        tx.set(supplierRef, {
+          name: supplierName || null,
+          supplierCategory: supplierCategory || null,
+          supplierTaxNumber: supplierTaxNumber || null,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp()
+        });
+        return;
+      }
+
+      const current = snap.data() || {};
+      const updates = {};
+      if (!current.name && supplierName) {
+        updates.name = supplierName;
+      }
+      if (!current.supplierCategory && supplierCategory) {
+        updates.supplierCategory = supplierCategory;
+      }
+      if (!current.supplierTaxNumber && supplierTaxNumber) {
+        updates.supplierTaxNumber = supplierTaxNumber;
+      }
+
+      if (Object.keys(updates).length) {
+        updates.updatedAt = serverTimestamp();
+        tx.update(supplierRef, updates);
+      }
+    });
+  } catch (error) {
+    console.error(`Failed to upsert supplier profile for ${supplierId}`, error);
+  }
 }
 
 function collectResponseText(response) {
@@ -748,6 +802,12 @@ exports.processInvoiceDocument = functions
       const invoiceNumber =
         mappedResult.invoiceNumber?.toString().match(/\d+/g)?.join('') || null;
       const uploadedBy = invoiceData.ownerUid || null;
+      await ensureSupplierProfile({
+        supplierId,
+        supplierName,
+        supplierTaxNumber,
+        supplierCategory: mappedResult.supplierCategory || null
+      });
 
       const pdfObjectPath = `suppliers/${supplierId}/invoices/${invoiceId}.pdf`;
       try {
@@ -785,7 +845,9 @@ exports.processInvoiceDocument = functions
         netAmount: parseAmount(mappedResult.netAmount),
         vatAmount: parseAmount(mappedResult.vat),
         vatRate: parseAmount(mappedResult.vatRate),
-        status: 'completed',
+        processingStatus: INVOICE_STATUS.uploaded,
+        paymentStatus: PAYMENT_STATUS.unpaid,
+        unpaidAmount: parseAmount(mappedResult.totalAmount),
         errorMessage: null,
         confidence: mappedResult.confidence ? Number(mappedResult.confidence) : null,
         createdAt: invoiceData.createdAt || serverTimestamp(),
