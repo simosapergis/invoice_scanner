@@ -53,6 +53,7 @@ const FIELD_LABELS = {
 
 const openAiApiKey = process.env.OPENAI_API_KEY || functions.config().openai?.key;
 const openaiClient = openAiApiKey ? new OpenAI({ apiKey: openAiApiKey }) : null;
+const OCR_MAX_RETRIES = 3;
 
 function extractBearerToken(headerValue) {
   if (!headerValue) return null;
@@ -445,6 +446,28 @@ async function runInvoiceOcr(pageBuffers) {
     return null;
   }
 
+  let lastError = null;
+  for (let attempt = 1; attempt <= OCR_MAX_RETRIES; attempt++) {
+    try {
+      const result = await runInvoiceOcrAttempt(pageBuffers);
+      if (result) {
+        if (attempt > 1) {
+          console.log(`OCR succeeded on retry attempt ${attempt}.`);
+        }
+        return result;
+      }
+      lastError = new Error('OCR attempt produced no result.');
+      console.warn(`OCR attempt ${attempt} produced no result; retrying...`);
+    } catch (error) {
+      lastError = error;
+      console.error(`OCR attempt ${attempt} failed`, error);
+    }
+  }
+
+  throw lastError || new Error(`OCR failed after ${OCR_MAX_RETRIES} attempts`);
+}
+
+async function runInvoiceOcrAttempt(pageBuffers) {
   const aggregatedText = [];
   for (const page of pageBuffers) {
     const mimeType = page.mimeType || 'application/octet-stream';
@@ -468,45 +491,103 @@ async function runInvoiceOcr(pageBuffers) {
       }
     } catch (visionError) {
       console.error('Vision API failed to read invoice text', { mimeType }, visionError);
-      return null;
+      throw visionError;
     }
   }
 
   const fullText = aggregatedText.join('\n\n');
   if (!fullText) {
-    console.warn('Vision API did not return any text for this invoice.');
-    return null;
+    throw new Error('Vision API did not return any text for this invoice.');
   }
 
   const systemPrompt = [
-    'You are an expert accountant specializing in OCR for European invoices.',
+    'You are an expert accountant and document-analysis specialist for Greek invoices.',
+    'You ALWAYS output strictly valid JSON following the schema provided by the user.',
     '',
-    'You will receive the raw Greek text of an invoice that was extracted via OCR.',
+    'You will be given the FULL multi-page OCR text of a Greek invoice.',
+    'The OCR may be noisy, misordered, or contain junk text from headers, footers, or page numbers.',
     '',
-    'IMPORTANT RULES:',
-    '1. The supplier/vendor (ΠΡΟΜΗΘΕΥΤΗΣ) is ALWAYS the entity printed at the top of the invoice.',
-    '2. The supplier TAX ID (ΑΦΜ ΠΡΟΜΗΘΕΥΤΗ) is ALWAYS located near the supplier’s address/logo.',
-    '3. The customer/buyer (ΠΕΛΑΤΗΣ) appears under sections such as "ΠΡΟΣ", “ΠΕΛΑΤΗΣ", or “ΑΠΟΔΕΚΤΗΣ".',
-    '4. NEVER confuse the customer with the supplier.',
-    '5. If more than one TAX ID (ΑΦΜ) is detected, choose the one closest to the supplier section.',
-    '6. Extract ONLY the supplier TAX ID — NOT the customer TAX ID.',
-    '7. Locate the final payable amount on the last page of the document. It will appear under or near a label such as "ΠΛΗΡΩΤΕΟ", "ΣΥΝΟΛΟ", or "ΤΕΛΙΚΟ". The final amount will always be shown as a number. If multiple final amounts are present, select the highest one.',
-    '8. Locate the VAT amount on the last page of the document. It appears near or under the final amount and is labeled "ΦΠΑ" or "Φ.Π.Α.". If multiple VAT amounts are present, always select the highest one',
-    '9. Locate the net amount (ΚΑΘΑΡΗ ΑΞΙΑ) on the last page of the document, near or under the VAT amount. It is labeled "ΚΑΘΑΡΗ ΑΞΙΑ" or "ΣΥΝΟΛΟ ΧΩΡΙΣ ΦΠΑ". If multiple net amounts appear, always select the highest one. The net amount represents the total before VAT is added.',
+    '===========================',
+    'GENERAL EXTRACTION RULES',
+    '===========================',
+    '1. Extract ONLY data from the actual invoice content. Ignore:',
+    '   - phone numbers',
+    '   - website URLs',
+    '   - footer disclaimers',
+    '   - page numbers',
+    '   - repeated totals from intermediate sections',
     '',
-    'Respond strictly in JSON that follows the provided schema.',
-    'If a value is missing or uncertain, return null.',
-    'Use dot-decimal notation for all amounts (e.g. 1234.56) and omit currency symbols.'
+    '2. Multi-page logic:',
+    '   - Supplier information ALWAYS appears on page 1.',
+    '   - Financial totals (Net, VAT, Payable) ALWAYS appear on the LAST page.',
+    '   - Do NOT mix totals from earlier pages.',
+    '   - If multiple candidates appear, prefer the last page\'s values.',
+    '',
+    '3. Supplier (ΠΡΟΜΗΘΕΥΤΗΣ):',
+    '   - Must be the entity printed at the top of page 1.',
+    '   - Ignore buyer/customer fields such as "ΠΡΟΣ", "ΠΕΛΑΤΗΣ", "ΑΠΟΔΕΚΤΗΣ".',
+    '   - If multiple business names appear, select the one positioned before the customer block.',
+    '',
+    '4. Supplier TAX ID (ΑΦΜ ΠΡΟΜΗΘΕΥΤΗ):',
+    '   - Must be 9 digits.',
+    '   - Must be located near the supplier\'s address/logo.',
+    '   - If multiple ΑΦΜ values appear, choose the one closest to the supplier name.',
+    '',
+    '5. Invoice Number (ΑΡΙΘΜΟΣ ΤΙΜΟΛΟΓΙΟΥ):',
+    '   - Accept typical prefixes: ΤΙΜ, ΤΙΜΟΛ, INV, ΤΠΥ, etc.',
+    '   - Remove spaces and non-alphanumeric garbage.',
+    '',
+    '6. Date (ΗΜΕΡΟΜΗΝΙΑ):',
+    '   - Must match dd/mm/yyyy or dd-mm-yyyy or yyyy-mm-dd.',
+    '   - If multiple dates appear, choose the one closest to the invoice header.',
+    '',
+    '7. Net Amount (ΚΑΘΑΡΗ ΑΞΙΑ):',
+    '   - Labeled "ΚΑΘΑΡΗ ΑΞΙΑ" or "ΣΥΝΟΛΟ ΧΩΡΙΣ ΦΠΑ" or "ΚΑΘΑΡΗ".',
+    '   - Extract ONLY the final net amount (last page).',
+    '',
+    '8. VAT Amount (ΦΠΑ):',
+    '   - Labeled "ΦΠΑ", "Φ.Π.Α.", or shows VAT percentage.',
+    '   - Select the final VAT amount (last page).',
+    '   - Must not include the percentage symbol.',
+    '',
+    '9. Payable Amount (ΠΛΗΡΩΤΕΟ):',
+    '   - Labeled "ΠΛΗΡΩΤΕΟ", "ΤΕΛΙΚΟ", "ΣΥΝΟΛΟ", "ΣΥΝΟΛΙΚΟ".',
+    '   - Select the highest valid amount among final totals.',
+    '',
+    '10. Amount formats:',
+    '    - Always return dot-decimal (1234.56).',
+    '    - Never include € symbols.',
+    '',
+    '11. If a field is uncertain or missing, set it to null.',
+    '',
+    '===========================',
+    'ACCURACY FIELD ("ΑΚΡΙΒΕΙΑ")',
+    '===========================',
+    'Return a value 0–100 representing confidence:',
+    '- 100 = all fields clearly present and correctly mapped',
+    '- 60–90 = some ambiguities',
+    '- < 60 = large uncertainty',
+    '',
+    '===========================',
+    'REASONING',
+    '===========================',
+    'Think step-by-step INTERNALLY.',
+    'Do NOT include reasoning in the output.',
+    'Output ONLY the final JSON.'
   ].join('\n');
 
   const extractionPrompt =
-    'Παρακάτω σου δίνω ΟΛΟ το κείμενο ενός τιμολογίου όπως προέκυψε από OCR. ' +
-    'Παρακαλώ εντόπισε και επέστρεψε τα παρακάτω πεδία στα ελληνικά. ' +
-    'Επιπλέον, πρόσθεσε και ένα πεδίο «ΑΚΡΙΒΕΙΑ» με ποσοστιαία εκτίμηση (0-100%) ' +
-    'για το πόσο βέβαιος είσαι ότι όλα τα υπόλοιπα δεδομένα είναι σωστά:\n' +
+    'Παρακάτω σου δίνω ΟΛΟ το κείμενο ενός (πιθανόν πολυσέλιδου) τιμολογίου όπως προέκυψε από OCR.\n\n' +
+    'Εντόπισε και επέστρεψε τα παρακάτω πεδία αυστηρά σε JSON, σύμφωνα με το schema:\n\n' +
     REQUIRED_FIELDS.map((field, idx) => `${idx + 1}. ${field}`).join('\n') +
-    '\n\nΑκολουθεί το κείμενο του τιμολογίου:\n\n' +
+    '\n\nΘυμήσου:\n' +
+    '- Ο προμηθευτής βρίσκεται μόνο στην πρώτη σελίδα.\n' +
+    '- Τα οικονομικά σύνολα βρίσκονται μόνο στην τελευταία σελίδα.\n' +
+    '- Αν κάποιο πεδίο δεν είναι βέβαιο, βάλε null.\n' +
+    '- Χρησιμοποίησε δεκαδικό με τελεία.\n\n' +
+    'Ακολουθεί το κείμενο του τιμολογίου:\n\n' +
     fullText;
+    
 
   const response = await openaiClient.responses.create({
     model: 'gpt-4o-mini',
@@ -851,14 +932,14 @@ exports.processInvoiceDocument = functions
         errorMessage: null,
         confidence: mappedResult.confidence ? Number(mappedResult.confidence) : null,
         createdAt: invoiceData.createdAt || serverTimestamp(),
-        processedAt: serverTimestamp()
+        uploadedAt: serverTimestamp()
       };
 
       await invoiceDocRef.set(invoicePayload, { merge: true });
 
       await change.after.ref.update({
         status: INVOICE_STATUS.done,
-        processedAt: serverTimestamp(),
+        uploadedAt: serverTimestamp(),
         processedInvoicePath: invoiceDocRef.path,
         confidence: invoicePayload.confidence,
         errorMessage: null,
