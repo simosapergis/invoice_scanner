@@ -922,7 +922,26 @@ exports.processInvoiceDocument = functions
         pages,
         bucketName
       );
-      const ocrResult = await runInvoiceOcr(downloadedPages);
+
+      // At this stage of the app, in order to avoid noise and extra charges from the Vision API
+      // and GPT, we will only OCR the first and last page of the invoice 
+      // since the supplier info, invoice number, date are on the first page 
+      // and the totals, amounts are on the last page. (MVP)
+      // For invoices with more than 2 pages, OCR only first and last page
+      // Page 1 = supplier info, invoice number, date
+      // Page N = totals, amounts
+      let pagesToOcr = downloadedPages;
+      if (downloadedPages.length > 2) {
+        const sortedPages = [...downloadedPages].sort((a, b) => a.pageNumber - b.pageNumber);
+        const firstPage = sortedPages[0];
+        const lastPage = sortedPages[sortedPages.length - 1];
+        pagesToOcr = [firstPage, lastPage];
+        console.log(
+          `Invoice has ${downloadedPages.length} pages; OCR will process only page ${firstPage.pageNumber} and page ${lastPage.pageNumber}`
+        );
+      }
+
+      const ocrResult = await runInvoiceOcr(pagesToOcr);
       if (!ocrResult) {
         throw new Error('OCR result was empty.');
       }
