@@ -528,6 +528,10 @@ async function runInvoiceOcrAttempt(pageBuffers) {
   const fullText = aggregatedText.join('\n\n');
   if (!fullText) {
     throw new Error('Vision API did not return any text for this invoice.');
+  } else {
+    console.log('Vision API returned BELOW TEXT******************* for this invoice.');
+    console.log(fullText);
+    console.log('Vision API returned ABOVE TEXT******************* for this invoice.');
   }
 
   const systemPrompt = [
