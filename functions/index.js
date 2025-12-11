@@ -515,7 +515,7 @@ async function runInvoiceOcrAttempt(pageBuffers) {
       });
       const pageText = visionResult?.fullTextAnnotation?.text?.trim();
       if (pageText) {
-        aggregatedText.push(`--- page ${page.pageNumber} ---\n${pageText}`);
+        aggregatedText.push(`=== PAGE ${page.pageNumber} ===\n${pageText}`);
       } else {
         console.warn(`Vision returned empty text for page ${page.pageNumber}`);
       }
@@ -540,15 +540,22 @@ async function runInvoiceOcrAttempt(pageBuffers) {
     '',
     'You will be given the FULL multi-page OCR text of a Greek invoice.',
     'The OCR may be noisy, misordered, or contain junk text from headers, footers, or page numbers.',
+    'The OCR you receive contains multiple pages in the format',
+    '=== PAGE 1 ===',
+    '... page 1 text ...',
+    '=== PAGE 2 ===',
+    '... page 2 text ...',
+    '=== PAGE N ===',
+    '... page N text ...',
     '',
     '===========================',
     'GENERAL EXTRACTION RULES',
     '===========================',
+    '0. Treat each page independently. Do not mix data from different pages.',
     '1. Extract ONLY data from the actual invoice content. Ignore:',
     '   - phone numbers',
     '   - website URLs',
     '   - footer disclaimers',
-    '   - page numbers',
     '   - repeated totals from intermediate sections',
     '',
     '2. Multi-page logic:',
@@ -578,6 +585,7 @@ async function runInvoiceOcrAttempt(pageBuffers) {
     '7. Net Amount (ΚΑΘΑΡΗ ΑΞΙΑ):',
     '   - Labeled "ΚΑΘΑΡΗ ΑΞΙΑ" or "ΣΥΝΟΛΟ ΧΩΡΙΣ ΦΠΑ" or "ΚΑΘΑΡΗ".',
     '   - Extract ONLY the final net amount (last page).',
+    '   - The CORRECT final net amount is the one that appears closest to the final payable amount (final amount Labeled "ΠΛΗΡΩΤΕΟ", "ΤΕΛΙΚΟ", "ΣΥΝΟΛΟ", "ΣΥΝΟΛΙΚΟ").',
     '',
     '8. VAT Amount (ΦΠΑ):',
     '   - Labeled "ΦΠΑ", "Φ.Π.Α.", or shows VAT percentage.',
