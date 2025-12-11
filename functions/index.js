@@ -550,9 +550,9 @@ async function runInvoiceOcrAttempt(pageBuffers) {
   // Normalize European decimals (2.383,13 → 2383.13) before GPT
   const fullText = normalizeEuropeanDecimals(ocrText);
 
-  console.log('Vision API returned BELOW TEXT******************* for this invoice.');
-  console.log(fullText);
-  console.log('Vision API returned ABOVE TEXT******************* for this invoice.');
+  // console.log('Vision API returned BELOW TEXT******************* for this invoice.');
+  // console.log(fullText);
+  // console.log('Vision API returned ABOVE TEXT******************* for this invoice.');
 
   const systemPrompt = [
     'You are an expert accountant and document-analysis specialist for Greek invoices.',
