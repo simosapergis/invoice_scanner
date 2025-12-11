@@ -85,6 +85,36 @@ function parseAmount(value) {
 
 function parseDate(value) {
   if (!value) return null;
+
+  // European format: dd/mm/yyyy or dd-mm-yyyy
+  const euMatch = value.match(/^(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})$/);
+  if (euMatch) {
+    const [, day, month, year] = euMatch;
+    const date = new Date(Date.UTC(
+      parseInt(year, 10),
+      parseInt(month, 10) - 1,
+      parseInt(day, 10)
+    ));
+    if (!Number.isNaN(date.getTime())) {
+      return admin.firestore.Timestamp.fromDate(date);
+    }
+  }
+
+  // ISO format: yyyy-mm-dd
+  const isoMatch = value.match(/^(\d{4})[/\-](\d{1,2})[/\-](\d{1,2})$/);
+  if (isoMatch) {
+    const [, year, month, day] = isoMatch;
+    const date = new Date(Date.UTC(
+      parseInt(year, 10),
+      parseInt(month, 10) - 1,
+      parseInt(day, 10)
+    ));
+    if (!Number.isNaN(date.getTime())) {
+      return admin.firestore.Timestamp.fromDate(date);
+    }
+  }
+
+  // Fallback for other formats
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return null;
   return admin.firestore.Timestamp.fromDate(date);
