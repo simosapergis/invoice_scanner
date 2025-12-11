@@ -78,9 +78,26 @@ function sanitizeId(value, fallback) {
 
 function parseAmount(value) {
   if (value === null || value === undefined) return null;
-  const normalized = value.toString().replace(/[^\d,.-]/g, '').replace(',', '.');
-  const num = Number(normalized);
+
+  // Remove everything except digits, dot, and minus (decimals already normalized before GPT)
+  const str = value.toString().replace(/[^\d.\-]/g, '');
+  if (!str) return null;
+
+  const num = Number(str);
   return Number.isFinite(num) ? num : null;
+}
+
+/**
+ * Normalize European decimal format in OCR text before sending to GPT.
+ * Converts "2.383,13" → "2383.13" so GPT sees standard decimal notation.
+ */
+function normalizeEuropeanDecimals(text) {
+  // Match European format: optional thousands separators (.) followed by comma decimal
+  // Examples: 2.383,13 | 383,13 | 1.234.567,89
+  return text.replace(
+    /\b(\d{1,3}(?:\.\d{3})*),(\d{1,2})\b/g,
+    (_, intPart, decPart) => intPart.replace(/\./g, '') + '.' + decPart
+  );
 }
 
 function parseDate(value) {
@@ -525,14 +542,17 @@ async function runInvoiceOcrAttempt(pageBuffers) {
     }
   }
 
-  const fullText = aggregatedText.join('\n\n');
-  if (!fullText) {
+  const ocrText = aggregatedText.join('\n\n');
+  if (!ocrText) {
     throw new Error('Vision API did not return any text for this invoice.');
-  } else {
-    console.log('Vision API returned BELOW TEXT******************* for this invoice.');
-    console.log(fullText);
-    console.log('Vision API returned ABOVE TEXT******************* for this invoice.');
   }
+
+  // Normalize European decimals (2.383,13 → 2383.13) before GPT
+  const fullText = normalizeEuropeanDecimals(ocrText);
+
+  console.log('Vision API returned BELOW TEXT******************* for this invoice.');
+  console.log(fullText);
+  console.log('Vision API returned ABOVE TEXT******************* for this invoice.');
 
   const systemPrompt = [
     'You are an expert accountant and document-analysis specialist for Greek invoices.',
