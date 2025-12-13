@@ -1041,3 +1041,263 @@ exports.processInvoiceDocument = functions
       });
     }
   });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PAYMENT STATUS UPDATE FUNCTION
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Securely updates the payment status of an invoice with full audit trail.
+//
+// Request Body:
+// {
+//   supplierId: string,         // Required - supplier identifier
+//   invoiceId: string,          // Required - invoice document ID
+//   action: "pay" | "partial",  // Required - payment action type
+//   amount?: number,            // Required for "partial", optional for "pay" (defaults to full)
+//   paymentMethod?: string,     // Optional - cash, bank_transfer, card, etc.
+//   paymentDate?: string,       // Optional - ISO date string, defaults to now
+//   notes?: string              // Optional - payment notes
+// }
+//
+// Security:
+// - Requires Firebase Authentication
+// - User must be the invoice owner (uploadedBy === uid)
+// - Input validation: positive amounts, no overpayment
+// - Atomic updates via Firestore transaction
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Validates and extracts the authenticated user from the request
+ */
+async function authenticateRequest(req) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return { error: 'Missing or invalid Authorization header', status: 401 };
+  }
+
+  const idToken = authHeader.split('Bearer ')[1];
+  try {
+    const decodedToken = await admin.auth().verifyIdToken(idToken);
+    return { user: decodedToken };
+  } catch (error) {
+    console.error('Token verification failed:', error);
+    return { error: 'Invalid or expired token', status: 401 };
+  }
+}
+
+/**
+ * Validates payment request body
+ */
+function validatePaymentRequest(body) {
+  const errors = [];
+
+  if (!body.supplierId || typeof body.supplierId !== 'string') {
+    errors.push('supplierId is required and must be a string');
+  }
+
+  if (!body.invoiceId || typeof body.invoiceId !== 'string') {
+    errors.push('invoiceId is required and must be a string');
+  }
+
+  if (!['pay', 'partial'].includes(body.action)) {
+    errors.push('action must be "pay" or "partial"');
+  }
+
+  if (body.action === 'partial') {
+    if (typeof body.amount !== 'number' || body.amount <= 0) {
+      errors.push('amount is required and must be a positive number for partial payments');
+    }
+  }
+
+  if (body.amount !== undefined && (typeof body.amount !== 'number' || body.amount < 0)) {
+    errors.push('amount must be a non-negative number');
+  }
+
+  if (body.paymentDate) {
+    const date = new Date(body.paymentDate);
+    if (isNaN(date.getTime())) {
+      errors.push('paymentDate must be a valid ISO date string');
+    }
+  }
+
+  if (body.notes && typeof body.notes !== 'string') {
+    errors.push('notes must be a string');
+  }
+
+  return errors;
+}
+
+/**
+ * Derives payment status from amounts
+ */
+function derivePaymentStatus(paidAmount, totalAmount) {
+  if (!totalAmount || totalAmount <= 0) {
+    // If totalAmount is unknown, we can't determine status accurately
+    return paidAmount > 0 ? PAYMENT_STATUS.partiallyPaid : PAYMENT_STATUS.unpaid;
+  }
+
+  if (paidAmount >= totalAmount) {
+    return PAYMENT_STATUS.paid;
+  }
+  if (paidAmount > 0) {
+    return PAYMENT_STATUS.partiallyPaid;
+  }
+  return PAYMENT_STATUS.unpaid;
+}
+
+exports.updatePaymentStatus = functions
+  .runWith({ serviceAccount: SERVICE_ACCOUNT_EMAIL })
+  .https.onRequest(async (req, res) => {
+    // CORS headers
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
+    if (req.method === 'OPTIONS') {
+      return res.status(204).send('');
+    }
+
+    if (req.method !== 'POST') {
+      return res.status(405).json({ error: 'Method not allowed. Use POST.' });
+    }
+
+    // 1. Authenticate
+    const authResult = await authenticateRequest(req);
+    if (authResult.error) {
+      return res.status(authResult.status).json({ error: authResult.error });
+    }
+    const user = authResult.user;
+
+    // 2. Validate request body
+    const body = req.body || {};
+    const validationErrors = validatePaymentRequest(body);
+    if (validationErrors.length > 0) {
+      return res.status(400).json({ 
+        error: 'Validation failed', 
+        details: validationErrors 
+      });
+    }
+
+    const { supplierId, invoiceId, action, paymentMethod, notes } = body;
+    const paymentDate = body.paymentDate 
+      ? admin.firestore.Timestamp.fromDate(new Date(body.paymentDate))
+      : admin.firestore.FieldValue.serverTimestamp();
+
+    const invoiceRef = db
+      .collection('suppliers')
+      .doc(supplierId)
+      .collection('invoices')
+      .doc(invoiceId);
+
+    try {
+      const result = await db.runTransaction(async (tx) => {
+        const invoiceSnap = await tx.get(invoiceRef);
+
+        // 3. Check invoice exists
+        if (!invoiceSnap.exists) {
+          throw Object.assign(
+            new Error(`Invoice not found: suppliers/${supplierId}/invoices/${invoiceId}`),
+            { httpStatus: 404 }
+          );
+        }
+
+        const invoiceData = invoiceSnap.data();
+
+        // 4. Authorization check - only owner can update
+        if (invoiceData.uploadedBy && invoiceData.uploadedBy !== user.uid) {
+          throw Object.assign(
+            new Error('You are not authorized to update this invoice'),
+            { httpStatus: 403 }
+          );
+        }
+
+        // 5. Get current payment state
+        const totalAmount = invoiceData.totalAmount || 0;
+        const currentPaidAmount = invoiceData.paidAmount || 0;
+        const currentUnpaidAmount = totalAmount - currentPaidAmount;
+
+        // 6. Calculate payment amount
+        let paymentAmount;
+        if (action === 'pay') {
+          // Full payment - pay remaining balance
+          paymentAmount = body.amount !== undefined ? body.amount : currentUnpaidAmount;
+        } else {
+          // Partial payment - use specified amount
+          paymentAmount = body.amount;
+        }
+
+        // 7. Validate payment doesn't exceed remaining balance
+        if (totalAmount > 0 && paymentAmount > currentUnpaidAmount + 0.01) {
+          throw Object.assign(
+            new Error(
+              `Payment amount (${paymentAmount.toFixed(2)}) exceeds unpaid balance (${currentUnpaidAmount.toFixed(2)})`
+            ),
+            { httpStatus: 400 }
+          );
+        }
+
+        // 8. Validate not already fully paid
+        if (invoiceData.paymentStatus === PAYMENT_STATUS.paid) {
+          throw Object.assign(
+            new Error('Invoice is already fully paid'),
+            { httpStatus: 400 }
+          );
+        }
+
+        // 9. Calculate new amounts
+        const newPaidAmount = currentPaidAmount + paymentAmount;
+        const newUnpaidAmount = Math.max(0, totalAmount - newPaidAmount);
+        const newPaymentStatus = derivePaymentStatus(newPaidAmount, totalAmount);
+
+        // 10. Build payment history entry
+        const paymentEntry = {
+          amount: paymentAmount,
+          paymentDate,
+          paymentMethod: paymentMethod || 'other',
+          notes: notes || null,
+          recordedAt: admin.firestore.FieldValue.serverTimestamp(),
+          recordedBy: user.uid
+        };
+
+        // 11. Update invoice document
+        tx.update(invoiceRef, {
+          paymentStatus: newPaymentStatus,
+          paidAmount: newPaidAmount,
+          unpaidAmount: newUnpaidAmount,
+          lastPaymentAt: admin.firestore.FieldValue.serverTimestamp(),
+          paymentHistory: admin.firestore.FieldValue.arrayUnion(paymentEntry),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        return {
+          invoiceId,
+          supplierId,
+          previousStatus: invoiceData.paymentStatus || PAYMENT_STATUS.unpaid,
+          newStatus: newPaymentStatus,
+          paymentAmount,
+          totalAmount,
+          paidAmount: newPaidAmount,
+          unpaidAmount: newUnpaidAmount
+        };
+      });
+
+      console.log(`Payment recorded for invoice ${invoiceId}:`, result);
+
+      return res.status(200).json({
+        success: true,
+        message: result.newStatus === PAYMENT_STATUS.paid 
+          ? 'Invoice marked as fully paid' 
+          : `Partial payment of ${result.paymentAmount.toFixed(2)} recorded`,
+        data: result
+      });
+
+    } catch (error) {
+      console.error('Payment update failed:', error);
+
+      const httpStatus = error.httpStatus || 500;
+      return res.status(httpStatus).json({
+        error: error.message,
+        code: httpStatus === 500 ? 'INTERNAL_ERROR' : 'PAYMENT_ERROR'
+      });
+    }
+  });
