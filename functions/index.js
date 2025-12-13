@@ -24,9 +24,8 @@ const INVOICE_STATUS = {
   error: 'error'
 };
 const PAYMENT_STATUS = {
-  unpaid: 'unpaid',
   paid: 'paid',
-  partiallyPaid: 'partiallyPaid'
+  partiallyPaid: 'partially_paid'
 };
 const serverTimestamp = admin.firestore.FieldValue.serverTimestamp;
 const REQUIRED_FIELDS = [
