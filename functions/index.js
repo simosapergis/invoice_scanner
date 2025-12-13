@@ -1255,7 +1255,7 @@ exports.updatePaymentStatus = functions
           paymentDate,
           paymentMethod: paymentMethod || 'other',
           notes: notes || null,
-          recordedAt: admin.firestore.FieldValue.serverTimestamp(),
+          recordedAt: admin.firestore.Timestamp.now(),
           recordedBy: user.uid
         };
 
