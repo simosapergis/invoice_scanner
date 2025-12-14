@@ -24,6 +24,7 @@ const INVOICE_STATUS = {
   error: 'error'
 };
 const PAYMENT_STATUS = {
+  unpaid: 'unpaid',
   paid: 'paid',
   partiallyPaid: 'partially_paid'
 };
