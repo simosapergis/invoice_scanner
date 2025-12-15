@@ -550,9 +550,9 @@ async function runInvoiceOcrAttempt(pageBuffers) {
   // Normalize European decimals (2.383,13 → 2383.13) before GPT
   const fullText = normalizeEuropeanDecimals(ocrText);
 
-  // console.log('Vision API returned BELOW TEXT******************* for this invoice.');
-  // console.log(fullText);
-  // console.log('Vision API returned ABOVE TEXT******************* for this invoice.');
+  console.log('Vision API returned BELOW TEXT******************* for this invoice.');
+  console.log(fullText);
+  console.log('Vision API returned ABOVE TEXT******************* for this invoice.');
 
   const systemPrompt = [
     'You are an expert accountant and document-analysis specialist for Greek invoices.',
@@ -585,24 +585,30 @@ async function runInvoiceOcrAttempt(pageBuffers) {
     '   - If multiple candidates appear, prefer the last page\'s values.',
     '',
     '3. Supplier (ΠΡΟΜΗΘΕΥΤΗΣ):',
-    '   - Must be the entity printed at the top of page 1.',
-    '   - The supplier name MUST match the business entity that has a tax ID (Α.Φ.Μ. or ΑΦΜ) printed immediately below or near it.',
-    '   - The supplier is the entity associated with tax, registration, or address fields such as Α.Φ.Μ., Δ.Ο.Υ., ΕΔΡΑ, ΔΙΕΥΘΥΝΣΗ, ΤΗΛ.',
-    '   - NEVER select software vendors, platform names, ERPs, portals, websites, or logos (e.g. Epsilon Net, e-invoice systems, QR code labels).',
-    '   - NEVER select entities printed near QR codes or URLs unless they also have a tax ID, physical address, and phone number.',
-    '   - If multiple names appear, the supplier is the one that forms a complete business block (name + AFM + address).',
-    '   - If no name is clearly tied to ΑΦΜ/ΔΟΥ/ΔΙΕΥΘΥΝΣΗ info, return null.',
+    '   - The supplier is the ISSUING company shown in the document header (top area of page 1).',
+    '   - Supplier info typically appears BEFORE any "ΣΤΟΙΧΕΙΑ ΠΕΛΑΤΗ" or "ΣΤΟΙΧΕΙΑ ΑΠΟΣΤΟΛΗΣ" sections.',
+    '   - The supplier block contains: company name/logo, address, phone, ΑΦΜ, ΔΟΥ.',
+    '   - NEVER confuse supplier with customer. The customer appears AFTER sections like:',
+    '     "ΣΤΟΙΧΕΙΑ ΠΕΛΑΤΗ", "ΕΠΩΝΥΜΙΑ ΠΕΛΑΤΗ", "ΠΕΛΑΤΗΣ", "ΑΠΟΔΕΚΤΗΣ", "ΠΑΡΑΛΗΠΤΗΣ".',
+    '   - If no name is clearly in the header, return null.',
     '',
     '4. Supplier TAX ID (ΑΦΜ ΠΡΟΜΗΘΕΥΤΗ):',
-    '   - The supplier is the legal entity shown in the document header (top of page). ',
-    '   - The supplier name usually appears in large or bold text and is NOT under "ΣΤΟΙΧΕΙΑ ΠΕΛΑΤΗ".',
-    '   - NEVER extract an ΑΦΜ that appears: under "ΣΤΟΙΧΕΙΑ ΠΕΛΑΤΗ", under "ΠΕΛΑΤΗΣ", under "ΑΠΟΔΕΚΤΗΣ".',
-    '   - If an ΑΦΜ is inside or below a section labeled "ΣΤΟΙΧΕΙΑ ΠΕΛΑΤΗ", it is ALWAYS the customer, discard it.',
-    '   - If multiple ΑΦΜ values exist, choose the one: 1. Closest to the supplier name in the header 2. Appearing BEFORE any "ΣΤΟΙΧΕΙΑ ΠΕΛΑΤΗ" section',
+    '   - The supplier ΑΦΜ is the 9-digit number in the document HEADER BLOCK (top of page).',
+    '   - It appears near/below the supplier company name, often with ΔΟΥ nearby.',
+    '   - CRITICAL EXCLUSION RULE:',
+    '     * Scan the OCR text for keywords: "ΣΤΟΙΧΕΙΑ ΠΕΛΑΤΗ", "ΣΤΟΙΧΕΙΑ ΑΠΟΣΤΟΛΗΣ", "ΕΠΩΝΥΜΙΑ ΠΕΛΑΤΗ", "ΠΕΛΑΤΗΣ".',
+    '     * Any ΑΦΜ appearing AFTER these keywords is the CUSTOMER ΑΦΜ - do NOT use it.',
+    '     * Only use an ΑΦΜ that appears BEFORE any customer section.',
+    '   - If there more than 1 ΑΦΜ or Α.Φ.Μ. values, the FIRST one (reading top-to-bottom) is almost always the supplier.',
     '   - Supplier ΑΦΜ must be exactly 9 digits.',
     '',
     '5. Invoice Number (ΑΡΙΘΜΟΣ ΤΙΜΟΛΟΓΙΟΥ):',
-    '   - Τhe invoice number is the number that appears at the top of the invoice, in a column where the header is ΑΡΙΘΜΟΣ',
+    '   - Look for a table/row with columns: ΣΕΙΡΑ | ΑΡΙΘΜΟΣ | ΗΜΕΡΟΜΗΝΙΑ (or similar).',
+    '   - The invoice number is the value under the "ΑΡΙΘΜΟΣ" column header.',
+    '   - CRITICAL EXCLUSION RULE:',
+    '     * NEVER use numbers from rows labeled "Σχετικά Παραστατικά", "Παραστατικά", or "Αριθ. Παραστ.".',
+    '     * These are reference/related document numbers, NOT the main invoice number.',
+    '   - The invoice number often has 5-7 digits (e.g., 090748) and may include a series prefix.',
     '   - Accept typical suffixes: ΤΔΑ, Τ-ΔΑ, ΤΙΜ, ΤΙΜΟΛ, INV, ΤΠΥ, etc.',
     '   - Remove spaces and non-alphanumeric garbage.',
     '',
@@ -650,8 +656,13 @@ async function runInvoiceOcrAttempt(pageBuffers) {
     'Παρακάτω σου δίνω ΟΛΟ το κείμενο ενός (πιθανόν πολυσέλιδου) τιμολογίου όπως προέκυψε από OCR.\n\n' +
     'Εντόπισε και επέστρεψε τα παρακάτω πεδία αυστηρά σε JSON, σύμφωνα με το schema:\n\n' +
     REQUIRED_FIELDS.map((field, idx) => `${idx + 1}. ${field}`).join('\n') +
-    '\n\nΘυμήσου:\n' +
-    '- Ο προμηθευτής βρίσκεται μόνο στην πρώτη σελίδα.\n' +
+    '\n\n⚠️ ΚΡΙΣΙΜΟΙ ΚΑΝΟΝΕΣ:\n' +
+    '- ΑΦΜ ΠΡΟΜΗΘΕΥΤΗ: Χρησιμοποίησε ΜΟΝΟ το ΑΦΜ που εμφανίζεται ΠΡΙΝ από οποιοδήποτε "ΣΤΟΙΧΕΙΑ ΠΕΛΑΤΗ" ΚΑΙ ΣΤΟΙΧΕΙΑ ΑΠΟΣΤΟΛΗΣ.\n' +
+    'Αν υπάρχουν πανω απο 1 ΑΦΜ, το ΠΡΩΤΟ (από πάνω προς τα κάτω) είναι του προμηθευτή.\n' +
+    '- ΑΡΙΘΜΟΣ ΤΙΜΟΛΟΓΙΟΥ: Χρησιμοποίησε τον αριθμό από τη στήλη "ΑΡΙΘΜΟΣ" (συνήθως δίπλα σε ΣΕΙΡΑ/ΗΜΕΡΟΜΗΝΙΑ). ' +
+    'ΠΟΤΕ μην χρησιμοποιήσεις αριθμούς από "Σχετικά Παραστατικά" - αυτοί είναι αριθμοί αναφοράς.\n' +
+    '\nΘυμήσου:\n' +
+    '- Ο προμηθευτής βρίσκεται μόνο στην πρώτη σελίδα, στην κορυφή της σελίδας.\n' +
     '- Τα οικονομικά σύνολα βρίσκονται μόνο στην τελευταία σελίδα.\n' +
     '- Αν κάποιο πεδίο δεν είναι βέβαιο, βάλε null.\n' +
     '- Χρησιμοποίησε δεκαδικό με τελεία.\n\n' +
