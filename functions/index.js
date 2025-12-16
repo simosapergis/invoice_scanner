@@ -725,9 +725,20 @@ async function runInvoiceOcrAttempt(pageBuffers) {
     '   - The supplier is the ISSUING company shown in the document header (top area of page 1).',
     '   - Supplier info typically appears BEFORE any "ΣΤΟΙΧΕΙΑ ΠΕΛΑΤΗ" or "ΣΤΟΙΧΕΙΑ ΑΠΟΣΤΟΛΗΣ" sections.',
     '   - The supplier block contains: company name/logo, address, phone, ΑΦΜ, ΔΟΥ.',
+    '   - CRITICAL: The supplier name MUST have its own ΑΦΜ (9-digit tax number) directly associated with it.',
     '   - NEVER confuse supplier with customer. The customer appears AFTER sections like:',
     '     "ΣΤΟΙΧΕΙΑ ΠΕΛΑΤΗ", "ΕΠΩΝΥΜΙΑ ΠΕΛΑΤΗ", "ΠΕΛΑΤΗΣ", "ΑΠΟΔΕΚΤΗΣ", "ΠΑΡΑΛΗΠΤΗΣ".',
-    '   - If no name is clearly in the header, return null.',
+    '   - CRITICAL EXCLUSION - ERP/SOFTWARE BRANDING:',
+    '     * Greek invoices often show branding from the ERP/invoicing software used to generate them.',
+    '     * These are NOT the supplier. IGNORE any name that appears with a website URL (e.g., https://...).',
+    '     * Common ERP/software companies to EXCLUDE as suppliers:',
+    '       - Epsilon Net, Epsilon Digital, epsilondigital.gr',
+    '       - SoftOne, Soft1, Galaxy',
+    '       - Entersoft, Singular Logic, Atlantis',
+    '       - Papirus, E-invoicing, myDATA',
+    '       - Any name appearing at the bottom of the page near a QR code or URL',
+    '     * The REAL supplier has an ΑΦΜ, ΔΟΥ, physical address - not just a website.',
+    '   - If no name is clearly in the header with associated ΑΦΜ, return null.',
     '',
     '4. Supplier TAX ID (ΑΦΜ ΠΡΟΜΗΘΕΥΤΗ):',
     '   - The supplier ΑΦΜ is the 9-digit number in the document HEADER BLOCK (top of page).',
@@ -800,6 +811,8 @@ async function runInvoiceOcrAttempt(pageBuffers) {
     'ΠΟΤΕ μην χρησιμοποιήσεις αριθμούς από "Σχετικά Παραστατικά" - αυτοί είναι αριθμοί αναφοράς.\n' +
     '\nΘυμήσου:\n' +
     '- Ο προμηθευτής βρίσκεται μόνο στην πρώτη σελίδα, στην κορυφή της σελίδας.\n' +
+    '- ΠΡΟΣΟΧΗ: Αγνόησε ονόματα εταιρειών ERP/λογισμικού (π.χ. Epsilon Net, SoftOne, Galaxy, Entersoft) - αυτές ΔΕΝ είναι ο προμηθευτής.\n' +
+    '- Ο ΠΡΑΓΜΑΤΙΚΟΣ προμηθευτής έχει δικό του ΑΦΜ, ΔΟΥ και διεύθυνση - όχι απλώς URL ιστοσελίδας.\n' +
     '- Τα οικονομικά σύνολα βρίσκονται μόνο στην τελευταία σελίδα.\n' +
     '- Αν κάποιο πεδίο δεν είναι βέβαιο, βάλε null.\n' +
     '- Χρησιμοποίησε δεκαδικό με τελεία.\n\n' +
