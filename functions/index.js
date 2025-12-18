@@ -1670,3 +1670,101 @@ exports.cleanupStaleTokens = functions
     console.log(`FCM token cleanup complete. Processed ${totalUsersProcessed} users, removed ${totalTokensRemoved} stale tokens.`);
     return null;
   });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SIGNED DOWNLOAD URL
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Generates a signed URL for downloading an invoice PDF from Cloud Storage.
+//
+// Request Body:
+// {
+//   filePath: string           // Required - path to file in storage (e.g. "suppliers/abc/invoices/xyz.pdf")
+// }
+//
+// Response:
+// {
+//   downloadUrl: string,       // Signed URL for downloading
+//   expiresAt: string          // ISO timestamp when URL expires
+// }
+//
+// Security:
+// - Requires Firebase Authentication (any authenticated user can download)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+exports.getSignedDownloadUrl = functions
+  .runWith({ serviceAccount: SERVICE_ACCOUNT_EMAIL })
+  .https.onRequest(async (req, res) => {
+    // CORS headers
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+
+    if (req.method === 'OPTIONS') {
+      return res.status(204).send('');
+    }
+
+    if (req.method !== 'POST') {
+      return res.status(405).json({ error: 'Method not allowed. Use POST.' });
+    }
+
+    // Authenticate
+    const idToken = extractBearerToken(req.header('Authorization'));
+    if (!idToken) {
+      return res.status(401).json({ error: 'Missing Authorization: Bearer <token>' });
+    }
+
+    let decodedToken;
+    try {
+      decodedToken = await admin.auth().verifyIdToken(idToken);
+    } catch (error) {
+      return res.status(401).json({
+        error: 'Invalid or expired Firebase ID token',
+        details: error.message
+      });
+    }
+
+    const { filePath } = req.body || {};
+
+    if (!filePath || typeof filePath !== 'string') {
+      return res.status(400).json({ error: 'filePath is required and must be a string' });
+    }
+
+    const bucketName = getBucketName();
+    if (!bucketName) {
+      return res.status(500).json({ error: 'Missing GCS bucket configuration' });
+    }
+
+    try {
+      // Check if file exists
+      const file = storage.bucket(bucketName).file(filePath);
+      const [exists] = await file.exists();
+
+      if (!exists) {
+        return res.status(404).json({ error: 'File not found' });
+      }
+
+      // Generate signed URL for reading/downloading
+      const expiresAtMs = Date.now() + SIGNED_URL_TTL_MS;
+
+      const [downloadUrl] = await file.getSignedUrl({
+        version: 'v4',
+        action: 'read',
+        expires: expiresAtMs
+      });
+
+      return res.status(200).json({
+        downloadUrl,
+        filePath,
+        bucket: bucketName,
+        expiresAt: new Date(expiresAtMs).toISOString()
+      });
+
+    } catch (error) {
+      console.error('Failed to generate signed download URL:', error);
+      return res.status(500).json({
+        error: 'Failed to generate download URL',
+        details: error.message
+      });
+    }
+  });
