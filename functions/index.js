@@ -150,6 +150,7 @@ async function ensureSupplierProfile({
   }
 
   const supplierRef = db.doc(`suppliers/${supplierId}`);
+ //TODO:if supplier already exists, do not update the profile
 
   try {
     await db.runTransaction(async (tx) => {
@@ -551,9 +552,6 @@ async function runInvoiceOcrAttempt(pageBuffers) {
   // Normalize European decimals (2.383,13 → 2383.13) before GPT
   const fullText = normalizeEuropeanDecimals(ocrText);
 
-  console.log('Vision API returned BELOW TEXT******************* for this invoice.');
-  console.log(fullText);
-  console.log('Vision API returned ABOVE TEXT******************* for this invoice.');
 
   const systemPrompt = [
     'You are an expert accountant and document-analysis specialist for Greek invoices.',
@@ -994,8 +992,7 @@ exports.processInvoiceDocument = functions
         supplierTaxNumber,
         sanitizeId(supplierName, 'unknown-supplier')
       );
-      const invoiceNumber =
-        mappedResult.invoiceNumber?.toString().match(/\d+/g)?.join('') || null;
+      const invoiceNumber = mappedResult.invoiceNumber?.toString().match(/\d+/g)?.join('') || null;
       const uploadedBy = invoiceData.ownerUid || null;
       await ensureSupplierProfile({
         supplierId,
@@ -1003,6 +1000,39 @@ exports.processInvoiceDocument = functions
         supplierTaxNumber,
         supplierCategory: mappedResult.supplierCategory || null
       });
+
+      // Check for duplicate invoice (same supplier + invoice number)
+      if (invoiceNumber && supplierId) {
+        const duplicateQuery = await db
+          .collection('suppliers')
+          .doc(supplierId)
+          .collection('invoices')
+          .where('invoiceNumber', '==', invoiceNumber)
+          .limit(1)
+          .get();
+
+        if (!duplicateQuery.empty) {
+          const existingInvoice = duplicateQuery.docs[0];
+          const errorMessage = `Duplicate invoice detected: Invoice #${invoiceNumber} already exists for supplier tax number: ${supplierId} name:${mappedResult.supplierName} (existing doc: ${existingInvoice.id})`;
+          
+          console.error(errorMessage);
+          
+          await change.after.ref.update({
+            status: INVOICE_STATUS.error,
+            errorMessage,
+            duplicateOf: existingInvoice.id,
+            detectedInvoiceNumber: invoiceNumber,
+            detectedSupplierId: supplierId,
+            updatedAt: serverTimestamp()
+          });
+
+
+        // TODO: finally send a notification to the user
+        //Since FCM is not an option due to iOS limitations, we can use onSnapshot for metadata_invoices collection 
+          
+          return;
+        }
+      }
 
       const pdfObjectPath = `suppliers/${supplierId}/invoices/${invoiceId}.pdf`;
       try {
