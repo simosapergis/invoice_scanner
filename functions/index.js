@@ -51,6 +51,31 @@ const FIELD_LABELS = {
   'ΑΚΡΙΒΕΙΑ': 'confidence'
 };
 
+const METADATA_ERROR_MESSAGE = "❌ Aποτυχία τιμολογίου ΤΔΑ-%s από %s. %s";
+const METADATA_SUCCESS_MESSAGE = "✅ Επιτυχία τιμολογίου ΤΔΑ-%s από %s.";
+
+/**
+ * Formats error message with prefix if invoiceNumber and supplierName are known.
+ */
+function formatMetadataError(invoiceNumber, supplierName, errorMsg) {
+  if (invoiceNumber && supplierName && supplierName !== 'Unknown Supplier') {
+    return METADATA_ERROR_MESSAGE
+      .replace('%s', invoiceNumber)
+      .replace('%s', supplierName)
+      .replace('%s', errorMsg);
+  }
+  return errorMsg;
+}
+
+/**
+ * Formats success message with invoiceNumber and supplierName.
+ */
+function formatMetadataSuccess(invoiceNumber, supplierName) {
+    return METADATA_SUCCESS_MESSAGE
+      .replace('%s', invoiceNumber)
+      .replace('%s', supplierName);
+}
+
 const openAiApiKey = process.env.OPENAI_API_KEY || functions.config().openai?.key;
 const openaiClient = openAiApiKey ? new OpenAI({ apiKey: openAiApiKey }) : null;
 const OCR_MAX_RETRIES = 3;
@@ -273,7 +298,8 @@ async function ensureInvoiceDocument({ invoiceId, uid, bucketName, totalPages })
         uploadedCount: 0,
         pages: [],
         createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp()
+        updatedAt: serverTimestamp(),
+        notificationSeen: false,
       });
 
       return {
@@ -513,7 +539,7 @@ async function runInvoiceOcr(pageBuffers) {
     }
   }
 
-  throw lastError || new Error(`OCR failed after ${OCR_MAX_RETRIES} attempts`);
+  throw lastError || new Error(`Aποτυχία OCR έπειτα από ${OCR_MAX_RETRIES} προσπάθειες`);
 }
 
 async function runInvoiceOcrAttempt(pageBuffers) {
@@ -881,7 +907,7 @@ exports.processInvoiceDocument = functions
       console.warn('OPENAI_API_KEY not configured; unable to run OCR.');
       await change.after.ref.update({
         status: INVOICE_STATUS.error,
-        errorMessage: 'OCR is disabled because OPENAI_API_KEY is missing.',
+        errorMessage: 'Αποτυχία OCR, το OPENAI_API_KEY λείπει.',
         updatedAt: serverTimestamp()
       });
       return;
@@ -920,7 +946,7 @@ exports.processInvoiceDocument = functions
     if (!bucketName) {
       await change.after.ref.update({
         status: INVOICE_STATUS.error,
-        errorMessage: 'Missing bucket configuration for invoice processing.',
+        errorMessage: 'Λείπει η ρύθμιση του bucket για την επεξεργασία τιμολογίου.',
         updatedAt: serverTimestamp()
       });
       return;
@@ -933,7 +959,7 @@ exports.processInvoiceDocument = functions
     if (!pages.length) {
       await change.after.ref.update({
         status: INVOICE_STATUS.error,
-        errorMessage: 'No pages were uploaded for this invoice.',
+        errorMessage: 'Δεν έγινε ανέβασμα τιμολογίου.',
         updatedAt: serverTimestamp()
       });
       return;
@@ -942,11 +968,15 @@ exports.processInvoiceDocument = functions
     if (invoiceData.totalPages && pages.length !== invoiceData.totalPages) {
       await change.after.ref.update({
         status: INVOICE_STATUS.error,
-        errorMessage: `Expected ${invoiceData.totalPages} pages but found ${pages.length}.`,
+        errorMessage: `Αναμενόταν ${invoiceData.totalPages} σελίδες αλλά βρέθηκαν ${pages.length}.`,
         updatedAt: serverTimestamp()
       });
       return;
     }
+
+    // Declare outside try block so they're accessible in catch for error formatting
+    let supplierName = null;
+    let invoiceNumber = null;
 
     try {
       const { combinedPdfBuffer, downloadedPages } = await buildCombinedPdfFromPages(
@@ -972,7 +1002,7 @@ exports.processInvoiceDocument = functions
         );
       }
 
-      const ocrResult = await runInvoiceOcr(pagesToOcr);
+    const ocrResult = await runInvoiceOcr(pagesToOcr);
       if (!ocrResult) {
         throw new Error('OCR result was empty.');
       }
@@ -986,13 +1016,13 @@ exports.processInvoiceDocument = functions
       console.log('OCR extraction (GR):', JSON.stringify(ocrResult, null, 2));
       console.log('OCR extraction (EN):', JSON.stringify(mappedResult, null, 2));
 
-      const supplierName = mappedResult.supplierName || 'Unknown Supplier';
+      supplierName = mappedResult.supplierName || 'Unknown Supplier';
       const supplierTaxNumber = mappedResult.supplierTaxNumber || null;
       const supplierId = sanitizeId(
         supplierTaxNumber,
         sanitizeId(supplierName, 'unknown-supplier')
       );
-      const invoiceNumber = mappedResult.invoiceNumber?.toString().match(/\d+/g)?.join('') || null;
+      invoiceNumber = mappedResult.invoiceNumber?.toString().match(/\d+/g)?.join('') || null;
       const uploadedBy = invoiceData.ownerUid || null;
       await ensureSupplierProfile({
         supplierId,
@@ -1013,7 +1043,8 @@ exports.processInvoiceDocument = functions
 
         if (!duplicateQuery.empty) {
           const existingInvoice = duplicateQuery.docs[0];
-          const errorMessage = `Duplicate invoice detected: Invoice #${invoiceNumber} already exists for supplier tax number: ${supplierId} name:${mappedResult.supplierName} (existing doc: ${existingInvoice.id})`;
+          const baseError = `Διπλότυπο τιμολόγιο (υπάρχον: ${existingInvoice.id})`;
+          const errorMessage = formatMetadataError(invoiceNumber, supplierName, baseError);
           
           console.error(errorMessage);
           
@@ -1087,6 +1118,7 @@ exports.processInvoiceDocument = functions
         processedInvoicePath: invoiceDocRef.path,
         confidence: invoicePayload.confidence,
         errorMessage: null,
+        successMessage: formatMetadataSuccess(invoiceNumber, supplierName),
         updatedAt: serverTimestamp()
       });
 
@@ -1094,10 +1126,12 @@ exports.processInvoiceDocument = functions
 
       // TODO: send notification on success
     } catch (error) {
-      console.error(`Failed to process invoice ${invoiceId}:`, error);
+      const baseError = `Αδυναμία επεξεργασίας τιμολογίου με id: ${invoiceId}. Σφάλμα: ${error.message}`;
+      const errorMessage = formatMetadataError(invoiceNumber, supplierName, baseError);
+      console.error(errorMessage);
       await change.after.ref.update({
         status: INVOICE_STATUS.error,
-        errorMessage: error.message,
+        errorMessage,
         updatedAt: serverTimestamp()
       });
 
