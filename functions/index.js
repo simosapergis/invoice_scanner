@@ -1057,10 +1057,6 @@ exports.processInvoiceDocument = functions
             updatedAt: serverTimestamp()
           });
 
-
-        // TODO: finally send a notification to the user
-        //Since FCM is not an option due to iOS limitations, we can use onSnapshot for metadata_invoices collection 
-          
           return;
         }
       }
@@ -1084,6 +1080,23 @@ exports.processInvoiceDocument = functions
       }
 
       const invoiceDocRef = db.doc(`suppliers/${supplierId}/invoices/${invoiceId}`);
+      
+      // Store original OCR data for reference when user edits fields
+      const ocrData = {
+        supplierName,
+        supplierTaxNumber,
+        invoiceNumber,
+        invoiceDate: mappedResult.invoiceDate || null,
+        dueDate: mappedResult.dueDate || null,
+        totalAmount: mappedResult.totalAmount || null,
+        currency: mappedResult.currency || 'EUR',
+        netAmount: mappedResult.netAmount || null,
+        vatAmount: mappedResult.vat || null,
+        vatRate: mappedResult.vatRate || null,
+        confidence: mappedResult.confidence ? Number(mappedResult.confidence) : null,
+        extractedAt: admin.firestore.Timestamp.now()
+      };
+
       const invoicePayload = {
         invoiceId,
         rawFilePaths: pages.map((p) => p.objectName),
@@ -1106,6 +1119,7 @@ exports.processInvoiceDocument = functions
         unpaidAmount: parseAmount(mappedResult.totalAmount),
         errorMessage: null,
         confidence: mappedResult.confidence ? Number(mappedResult.confidence) : null,
+        ocr: ocrData,
         createdAt: invoiceData.createdAt || serverTimestamp(),
         uploadedAt: serverTimestamp()
       };
@@ -1399,6 +1413,297 @@ exports.updatePaymentStatus = functions
     }
   });
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// UPDATE INVOICE FIELDS
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Updates editable invoice fields. Recalculates payment status when amounts change.
+//
+// Request Body:
+// {
+//   supplierId: string,           // Required - supplier identifier
+//   invoiceId: string,            // Required - invoice document ID
+//   fields: {                     // Required - fields to update (all optional)
+//     supplierName?: string,
+//     supplierTaxNumber?: string,
+//     invoiceNumber?: string,
+//     invoiceDate?: string,       // ISO date string
+//     dueDate?: string,           // ISO date string
+//     totalAmount?: number,
+//     netAmount?: number,
+//     vatAmount?: number,
+//     vatRate?: number,
+//     currency?: string,
+//     paidAmount?: number         // Will recalculate unpaidAmount & paymentStatus
+//   }
+// }
+//
+// Security:
+// - Requires Firebase Authentication
+// - Atomic updates via Firestore transaction
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Allowed fields that can be edited by the user
+const EDITABLE_INVOICE_FIELDS = [
+  'supplierName',
+  'supplierTaxNumber',
+  'invoiceNumber',
+  'invoiceDate',
+  'dueDate',
+  'totalAmount',
+  'netAmount',
+  'vatAmount',
+  'vatRate',
+  'paidAmount'
+];
+
+/**
+ * Validates update invoice fields request body
+ */
+function validateUpdateFieldsRequest(body) {
+  const errors = [];
+
+  if (!body.supplierId || typeof body.supplierId !== 'string') {
+    errors.push('supplierId is required and must be a string');
+  }
+
+  if (!body.invoiceId || typeof body.invoiceId !== 'string') {
+    errors.push('invoiceId is required and must be a string');
+  }
+
+  if (!body.fields || typeof body.fields !== 'object') {
+    errors.push('fields is required and must be an object');
+    return errors;
+  }
+
+  const fields = body.fields;
+
+  // Validate field types
+  if (fields.supplierName !== undefined && typeof fields.supplierName !== 'string') {
+    errors.push('fields.supplierName must be a string');
+  }
+
+  if (fields.supplierTaxNumber !== undefined && typeof fields.supplierTaxNumber !== 'string') {
+    errors.push('fields.supplierTaxNumber must be a string');
+  }
+
+  if (fields.invoiceNumber !== undefined && typeof fields.invoiceNumber !== 'string') {
+    errors.push('fields.invoiceNumber must be a string');
+  }
+
+  if (fields.currency !== undefined && typeof fields.currency !== 'string') {
+    errors.push('fields.currency must be a string');
+  }
+
+  // Validate date fields
+  if (fields.invoiceDate !== undefined) {
+    const date = new Date(fields.invoiceDate);
+    if (isNaN(date.getTime())) {
+      errors.push('fields.invoiceDate must be a valid ISO date string');
+    }
+  }
+
+  if (fields.dueDate !== undefined) {
+    const date = new Date(fields.dueDate);
+    if (isNaN(date.getTime())) {
+      errors.push('fields.dueDate must be a valid ISO date string');
+    }
+  }
+
+  // Validate numeric fields
+  const numericFields = ['totalAmount', 'netAmount', 'vatAmount', 'vatRate', 'paidAmount'];
+  for (const field of numericFields) {
+    if (fields[field] !== undefined) {
+      if (typeof fields[field] !== 'number' || isNaN(fields[field])) {
+        errors.push(`fields.${field} must be a valid number`);
+      } else if (fields[field] < 0) {
+        errors.push(`fields.${field} must be non-negative`);
+      }
+    }
+  }
+
+  // Check for unknown fields
+  const providedFields = Object.keys(fields);
+  const unknownFields = providedFields.filter(f => !EDITABLE_INVOICE_FIELDS.includes(f));
+  if (unknownFields.length > 0) {
+    errors.push(`Unknown fields: ${unknownFields.join(', ')}. Allowed: ${EDITABLE_INVOICE_FIELDS.join(', ')}`);
+  }
+
+  return errors;
+}
+
+exports.updateInvoiceFields = functions
+  .runWith({ serviceAccount: SERVICE_ACCOUNT_EMAIL })
+  .https.onRequest(async (req, res) => {
+    // CORS headers
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
+    if (req.method === 'OPTIONS') {
+      return res.status(204).send('');
+    }
+
+    if (req.method !== 'POST') {
+      return res.status(405).json({ error: 'Method not allowed. Use POST.' });
+    }
+
+    // 1. Authenticate
+    const authResult = await authenticateRequest(req);
+    if (authResult.error) {
+      return res.status(authResult.status).json({ error: authResult.error });
+    }
+    const user = authResult.user;
+
+    // 2. Validate request body
+    const body = req.body || {};
+    const validationErrors = validateUpdateFieldsRequest(body);
+    if (validationErrors.length > 0) {
+      return res.status(400).json({
+        error: 'Validation failed',
+        details: validationErrors
+      });
+    }
+
+    const { supplierId, invoiceId, fields } = body;
+
+    const invoiceRef = db
+      .collection('suppliers')
+      .doc(supplierId)
+      .collection('invoices')
+      .doc(invoiceId);
+
+    try {
+      const result = await db.runTransaction(async (tx) => {
+        const invoiceSnap = await tx.get(invoiceRef);
+
+        // 3. Check invoice exists
+        if (!invoiceSnap.exists) {
+          throw Object.assign(
+            new Error(`Invoice not found: suppliers/${supplierId}/invoices/${invoiceId}`),
+            { httpStatus: 404 }
+          );
+        }
+
+        const invoiceData = invoiceSnap.data();
+
+        // 4. Build update object
+        const updates = {
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          lastEditedBy: user.uid,
+          lastEditedAt: admin.firestore.FieldValue.serverTimestamp()
+        };
+
+        // Track which fields are being updated
+        const updatedFields = [];
+
+        // Process string fields
+        if (fields.supplierName !== undefined) {
+          updates.supplierName = fields.supplierName;
+          updatedFields.push('supplierName');
+        }
+        if (fields.supplierTaxNumber !== undefined) {
+          updates.supplierTaxNumber = fields.supplierTaxNumber;
+          updatedFields.push('supplierTaxNumber');
+        }
+        if (fields.invoiceNumber !== undefined) {
+          updates.invoiceNumber = fields.invoiceNumber;
+          updatedFields.push('invoiceNumber');
+        }
+        if (fields.currency !== undefined) {
+          updates.currency = fields.currency;
+          updatedFields.push('currency');
+        }
+
+        // Process date fields
+        if (fields.invoiceDate !== undefined) {
+          updates.invoiceDate = admin.firestore.Timestamp.fromDate(new Date(fields.invoiceDate));
+          updatedFields.push('invoiceDate');
+        }
+        if (fields.dueDate !== undefined) {
+          updates.dueDate = admin.firestore.Timestamp.fromDate(new Date(fields.dueDate));
+          updatedFields.push('dueDate');
+        }
+
+        // Process numeric fields
+        if (fields.netAmount !== undefined) {
+          updates.netAmount = fields.netAmount;
+          updatedFields.push('netAmount');
+        }
+        if (fields.vatAmount !== undefined) {
+          updates.vatAmount = fields.vatAmount;
+          updatedFields.push('vatAmount');
+        }
+        if (fields.vatRate !== undefined) {
+          updates.vatRate = fields.vatRate;
+          updatedFields.push('vatRate');
+        }
+
+        // 5. Handle amount changes with payment recalculation
+        const currentTotalAmount = invoiceData.totalAmount || 0;
+        const currentPaidAmount = invoiceData.paidAmount || 0;
+
+        let newTotalAmount = currentTotalAmount;
+        let newPaidAmount = currentPaidAmount;
+
+        if (fields.totalAmount !== undefined) {
+          newTotalAmount = fields.totalAmount;
+          updates.totalAmount = newTotalAmount;
+          updatedFields.push('totalAmount');
+        }
+
+        if (fields.paidAmount !== undefined) {
+          newPaidAmount = fields.paidAmount;
+          updates.paidAmount = newPaidAmount;
+          updatedFields.push('paidAmount');
+        }
+
+        // Recalculate unpaidAmount and paymentStatus if amounts changed
+        if (fields.totalAmount !== undefined || fields.paidAmount !== undefined) {
+          // Validate paidAmount doesn't exceed totalAmount
+          if (newPaidAmount > newTotalAmount + 0.01) {
+            throw Object.assign(
+              new Error(`paidAmount (${newPaidAmount.toFixed(2)}) cannot exceed totalAmount (${newTotalAmount.toFixed(2)})`),
+              { httpStatus: 400 }
+            );
+          }
+
+          updates.unpaidAmount = Math.max(0, newTotalAmount - newPaidAmount);
+          updates.paymentStatus = derivePaymentStatus(newPaidAmount, newTotalAmount);
+        }
+
+        // 6. Update invoice document
+        tx.update(invoiceRef, updates);
+
+        return {
+          invoiceId,
+          supplierId,
+          updatedFields,
+          totalAmount: newTotalAmount,
+          paidAmount: newPaidAmount,
+          unpaidAmount: updates.unpaidAmount !== undefined ? updates.unpaidAmount : (invoiceData.unpaidAmount || 0),
+          paymentStatus: updates.paymentStatus || invoiceData.paymentStatus
+        };
+      });
+
+      console.log(`Invoice fields updated for ${invoiceId}:`, result.updatedFields);
+
+      return res.status(200).json({
+        success: true,
+        message: `Updated ${result.updatedFields.length} field(s): ${result.updatedFields.join(', ')}`,
+        data: result
+      });
+
+    } catch (error) {
+      console.error('Invoice field update failed:', error);
+
+      const httpStatus = error.httpStatus || 500;
+      return res.status(httpStatus).json({
+        error: error.message,
+        code: httpStatus === 500 ? 'INTERNAL_ERROR' : 'UPDATE_ERROR'
+      });
+    }
+  });
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SIGNED DOWNLOAD URL
