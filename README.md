@@ -22,7 +22,7 @@ node invoice_ocr.js my_invoice.pdf
 export FIREBASE_API_KEY=your-firebase-web-api-key
 export FIREBASE_AUTH_EMAIL=your-user@example.com
 export FIREBASE_AUTH_PASSWORD=super-secret
-export FIREBASE_PROJECT_ID=level-approach-479119-b3          # or set SIGNED_URL_ENDPOINT directly
+export FIREBASE_PROJECT_ID=clean-abacus-482115-a1          # or set SIGNED_URL_ENDPOINT directly
 export FIREBASE_FUNCTION_REGION=europe-west8                 # default is us-central1
 # Start a new invoice (page 1 of 3)
 npm run upload:invoice -- ./invoice-page1.jpg --page 1 --total-pages 3 --content-type image/jpeg
@@ -98,7 +98,7 @@ npm run auth:login
 $env:FIREBASE_API_KEY = "your-firebase-web-api-key"
 $env:FIREBASE_AUTH_EMAIL = "your-user@example.com"
 $env:FIREBASE_AUTH_PASSWORD = "super-secret"
-$env:FIREBASE_PROJECT_ID = "level-approach-479119-b3"   # or set SIGNED_URL_ENDPOINT
+$env:FIREBASE_PROJECT_ID = "clean-abacus-482115-a1"   # or set SIGNED_URL_ENDPOINT
 #$env:FIREBASE_FUNCTION_REGION = "europe-west8"
 # Page 1 of a 2-page invoice
 npm run upload:invoice -- .\invoice-page1.jpg --page 1 --total-pages 2 --content-type image/jpeg
@@ -115,7 +115,47 @@ npm run signed-url:server
 firebase functions:config:set uploads.bucket="your-upload-bucket"
 
 # Deploy all functions (whole index.js)
-firebase deploy --only functions --project level-approach-479119-b3
+firebase deploy --only functions --project clean-abacus-482115-a1
 # Deploy specific function (e.g getSignedUploadUrl)
 firebase deploy --only functions:getSignedUploadUrl
 ```
+
+# Extract current rules and indexes from google console
+firebase init firestore
+
+# Deploy firestore rules and indexes [firestore.rules, firestore.indexes.json] referenced in firebase.json
+firebase deploy --only firestore:rules,firestore:indexes
+
+# Export Cloud Functions runtime config / env  (Legacy)
+firebase functions:config:get > functions.config.json
+
+# Deploy cloud functions
+
+
+###### Starting a new project (clone) ######
+
+# 0. Select the correct (new) project - add alias "prod"
+firebase use --add 
+
+# 1. Verify selected project
+firebase use 
+
+# 2. set gcloud pointing to the new project
+gcloud config set project clean-abacus-482115-a1
+
+# 3. Create bucket
+gcloud storage buckets create gs://clean-abacus-482115-a1.firebasestorage.app \
+  --location=europe-west8 \
+  --uniform-bucket-level-access 
+
+# 4. Create rules/indexes for firestore (no collection needs to be created prior)
+firebase deploy --only firestore:rules,firestore:indexes
+
+# 5. Set functions config (v1)
+firebase functions:config:set uploads.bucket="clean-abacus-482115-a1.firebasestorage.app" 
+firebase functions:config:set serviceaccount.email=<service_account>
+firebase functions:config:set region.name="europe-west6"
+firebase functions:config:set openai.key="<..>"
+
+# 6. Deploy functions
+firebase deploy --only functions

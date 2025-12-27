@@ -1,5 +1,7 @@
 {
   "projects": {
-    "default": "level-approach-479119-b3"
-  }
+    "prod": "clean-abacus-482115-a1"
+  },
+  "targets": {},
+  "etags": {}
 }

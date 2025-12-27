@@ -1,0 +1,41 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Allow authenticated users to read supplier docs; everything else stays blocked.
+    match /suppliers/{supplierId} {
+      allow read: if request.auth != null;
+      allow write: if false;   // keep writes locked to backend for now
+    }
+    
+    // Allow authenticated users to read supplier invoices; everything else stays blocked.
+    match /suppliers/{supplierId}/invoices/{document=**} {
+      allow read: if request.auth != null;
+      allow write: if false;   // keep writes locked to backend for now
+    }
+    
+    // collectionGroup query for ALL invoices subcollections
+    match /{path=**}/invoices/{invoiceId} {
+      allow read: if request.auth != null;
+      allow write: if false;   // keep writes locked to backend for now
+    }
+
+    match /metadata_invoices/{document=**} {
+      allow read: if request.auth != null;
+      allow update: 
+      if request.auth != null 
+      && resource.data.ownerUid == request.auth.uid
+  		&& request.resource.data.diff(resource.data)
+  		.changedKeys()
+  		.hasOnly(['notificationSeen', 'notificationSeenAt'])
+  		&& ( !('notificationSeen' in request.resource.data) || request.resource.data.notificationSeen is bool )
+  		&& ( !('notificationSeenAt' in request.resource.data) || request.resource.data.notificationSeenAt is timestamp );
+    }
+    
+    // Default deny for all other paths
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

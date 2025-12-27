@@ -13,7 +13,12 @@ const visionClient = new vision.ImageAnnotatorClient();
 const db = admin.firestore();
 const UPLOADS_PREFIX = 'uploads/';
 const METADATA_INVOICE_COLLECTION = 'metadata_invoices';
-const SERVICE_ACCOUNT_EMAIL = 'mylogia@level-approach-479119-b3.iam.gserviceaccount.com';
+const SERVICE_ACCOUNT_EMAIL = functions.config().serviceaccount?.email || process.env.SERVICE_ACCOUNT_EMAIL;
+const REGION = functions.config().region?.name || process.env.REGION;
+
+console.log('env SERVICE_ACCOUNT_EMAIL', SERVICE_ACCOUNT_EMAIL);
+console.log('env REGION', REGION);
+
 const SIGNED_URL_TTL_MS = 15 * 60 * 1000;
 const INVOICE_STATUS = {
   pending: 'pending',
@@ -51,20 +56,35 @@ const FIELD_LABELS = {
   'ΑΚΡΙΒΕΙΑ': 'confidence'
 };
 
+const METADATA_ERROR_MESSAGE = "❌ Aποτυχία τιμολογίου ΤΔΑ-%s από %s. %s";
+const METADATA_SUCCESS_MESSAGE = "✅ Επιτυχία τιμολογίου ΤΔΑ-%s από %s.";
+
+/**
+ * Formats error message with prefix if invoiceNumber and supplierName are known.
+ */
+function formatMetadataError(invoiceNumber, supplierName, errorMsg) {
+  if (invoiceNumber && supplierName && supplierName !== 'Unknown Supplier') {
+    return METADATA_ERROR_MESSAGE
+      .replace('%s', invoiceNumber)
+      .replace('%s', supplierName)
+      .replace('%s', errorMsg);
+  }
+  return errorMsg;
+}
+
+/**
+ * Formats success message with invoiceNumber and supplierName.
+ */
+function formatMetadataSuccess(invoiceNumber, supplierName) {
+    return METADATA_SUCCESS_MESSAGE
+      .replace('%s', invoiceNumber)
+      .replace('%s', supplierName);
+}
+
 const openAiApiKey = process.env.OPENAI_API_KEY || functions.config().openai?.key;
 const openaiClient = openAiApiKey ? new OpenAI({ apiKey: openAiApiKey }) : null;
 const OCR_MAX_RETRIES = 3;
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// FCM CONFIGURATION
-// ═══════════════════════════════════════════════════════════════════════════════
-const USERS_COLLECTION = 'users';
-const FCM_TOKEN_STALE_DAYS = 60;
-const FCM_INVALID_TOKEN_ERRORS = [
-  'messaging/registration-token-not-registered',
-  'messaging/invalid-registration-token',
-  'messaging/mismatched-sender-id'
-];
 
 function extractBearerToken(headerValue) {
   if (!headerValue) return null;
@@ -160,6 +180,7 @@ async function ensureSupplierProfile({
   }
 
   const supplierRef = db.doc(`suppliers/${supplierId}`);
+ //TODO:if supplier already exists, do not update the profile
 
   try {
     await db.runTransaction(async (tx) => {
@@ -195,132 +216,6 @@ async function ensureSupplierProfile({
   } catch (error) {
     console.error(`Failed to upsert supplier profile for ${supplierId}`, error);
   }
-}
-
-/**
- * Sends FCM notification to a user when invoice processing completes.
- * Automatically cleans up invalid/expired tokens.
- * 
- * @param {string} userId - The user ID to notify
- * @param {Object} payload - Notification payload
- * @param {string} payload.invoiceId - Invoice ID
- * @param {string} payload.status - 'done' | 'error'
- * @param {string} [payload.supplierId] - Supplier ID (on success)
- * @param {string} [payload.supplierName] - Supplier name (on success)
- * @param {string} [payload.invoiceNumber] - Invoice number (on success)
- * @param {string} [payload.errorMessage] - Error message (on error)
- */
-async function sendInvoiceNotification(userId, payload) {
-  if (!userId) {
-    console.warn('sendInvoiceNotification: No userId provided, skipping.');
-    return { sent: 0, failed: 0, cleaned: 0 };
-  }
-
-  const userRef = db.doc(`${USERS_COLLECTION}/${userId}`);
-  const userDoc = await userRef.get();
-
-  if (!userDoc.exists) {
-    console.warn(`sendInvoiceNotification: User ${userId} not found.`);
-    return { sent: 0, failed: 0, cleaned: 0 };
-  }
-
-  const userData = userDoc.data();
-  const fcmTokens = userData.fcmTokens || {};
-  const tokenEntries = Object.entries(fcmTokens);
-
-  if (!tokenEntries.length) {
-    console.log(`sendInvoiceNotification: User ${userId} has no FCM tokens.`);
-    return { sent: 0, failed: 0, cleaned: 0 };
-  }
-
-  // Build FCM data message (all values must be strings)
-  const dataPayload = {
-    type: 'invoice_processed',
-    invoiceId: payload.invoiceId || '',
-    status: payload.status || '',
-    supplierId: payload.supplierId || '',
-    supplierName: payload.supplierName || '',
-    invoiceNumber: payload.invoiceNumber || '',
-    errorMessage: payload.errorMessage || '',
-    timestamp: new Date().toISOString()
-  };
-
-  const tokensToDelete = [];
-  let sent = 0;
-  let failed = 0;
-
-  for (const [tokenId, tokenData] of tokenEntries) {
-    const token = typeof tokenData === 'string' ? tokenData : tokenData?.token;
-    if (!token) {
-      tokensToDelete.push(tokenId);
-      continue;
-    }
-
-    try {
-      await admin.messaging().send({
-        token,
-        data: dataPayload,
-        // Optional: Add notification for display when app is in background
-        notification: payload.status === 'done'
-          ? {
-              title: 'Invoice Processed',
-              body: payload.invoiceNumber
-                ? `Invoice ${payload.invoiceNumber} from ${payload.supplierName || 'supplier'} is ready`
-                : 'Your invoice has been processed successfully'
-            }
-          : {
-              title: 'Invoice Processing Failed',
-              body: payload.errorMessage || 'There was an error processing your invoice'
-            },
-        android: {
-          priority: 'high',
-          notification: { channelId: 'invoices' }
-        },
-        apns: {
-          payload: {
-            aps: {
-              sound: 'default',
-              badge: 1
-            }
-          }
-        }
-      });
-
-      sent++;
-
-      // Update lastActiveAt for this token
-      await userRef.update({
-        [`fcmTokens.${tokenId}.lastActiveAt`]: admin.firestore.Timestamp.now()
-      });
-
-    } catch (error) {
-      failed++;
-      console.error(`FCM send failed for user ${userId}, token ${tokenId}:`, error.code || error.message);
-
-      // Check if token is permanently invalid
-      if (FCM_INVALID_TOKEN_ERRORS.includes(error.code)) {
-        console.warn(`Marking invalid FCM token for deletion: ${tokenId}`);
-        tokensToDelete.push(tokenId);
-      }
-    }
-  }
-
-  // Batch delete invalid tokens
-  if (tokensToDelete.length > 0) {
-    const updates = {};
-    for (const tokenId of tokensToDelete) {
-      updates[`fcmTokens.${tokenId}`] = admin.firestore.FieldValue.delete();
-    }
-    try {
-      await userRef.update(updates);
-      console.log(`Cleaned ${tokensToDelete.length} invalid FCM tokens for user ${userId}`);
-    } catch (cleanupError) {
-      console.error(`Failed to cleanup FCM tokens for user ${userId}:`, cleanupError);
-    }
-  }
-
-  console.log(`FCM notification result for user ${userId}: sent=${sent}, failed=${failed}, cleaned=${tokensToDelete.length}`);
-  return { sent, failed, cleaned: tokensToDelete.length };
 }
 
 function collectResponseText(response) {
@@ -408,7 +303,8 @@ async function ensureInvoiceDocument({ invoiceId, uid, bucketName, totalPages })
         uploadedCount: 0,
         pages: [],
         createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp()
+        updatedAt: serverTimestamp(),
+        notificationSeen: false,
       });
 
       return {
@@ -648,7 +544,7 @@ async function runInvoiceOcr(pageBuffers) {
     }
   }
 
-  throw lastError || new Error(`OCR failed after ${OCR_MAX_RETRIES} attempts`);
+  throw lastError || new Error(`Aποτυχία OCR έπειτα από ${OCR_MAX_RETRIES} προσπάθειες`);
 }
 
 async function runInvoiceOcrAttempt(pageBuffers) {
@@ -687,9 +583,6 @@ async function runInvoiceOcrAttempt(pageBuffers) {
   // Normalize European decimals (2.383,13 → 2383.13) before GPT
   const fullText = normalizeEuropeanDecimals(ocrText);
 
-  console.log('Vision API returned BELOW TEXT******************* for this invoice.');
-  console.log(fullText);
-  console.log('Vision API returned ABOVE TEXT******************* for this invoice.');
 
   const systemPrompt = [
     'You are an expert accountant and document-analysis specialist for Greek invoices.',
@@ -865,6 +758,7 @@ async function runInvoiceOcrAttempt(pageBuffers) {
 
 //exports.getSignedUploadUrl = functions.region('europe-west8').https.onRequest(async (req, res) => {
 exports.getSignedUploadUrl = functions
+  .region(REGION)
   .runWith({ serviceAccount: SERVICE_ACCOUNT_EMAIL })
   .https.onRequest(async (req, res) => {
   res.set('Access-Control-Allow-Origin', '*');
@@ -958,6 +852,7 @@ exports.getSignedUploadUrl = functions
 });
 
 exports.processUploadedInvoice = functions
+  .region(REGION)
   .runWith({ serviceAccount: SERVICE_ACCOUNT_EMAIL })
   .storage.object()
   .onFinalize(async (object) => {
@@ -998,6 +893,7 @@ exports.processUploadedInvoice = functions
 });
 
 exports.processInvoiceDocument = functions
+  .region(REGION)
   .runWith({ serviceAccount: SERVICE_ACCOUNT_EMAIL })
   .firestore.document(`${METADATA_INVOICE_COLLECTION}/{invoiceId}`)
   .onWrite(async (change, context) => {
@@ -1019,7 +915,7 @@ exports.processInvoiceDocument = functions
       console.warn('OPENAI_API_KEY not configured; unable to run OCR.');
       await change.after.ref.update({
         status: INVOICE_STATUS.error,
-        errorMessage: 'OCR is disabled because OPENAI_API_KEY is missing.',
+        errorMessage: 'Αποτυχία OCR, το OPENAI_API_KEY λείπει.',
         updatedAt: serverTimestamp()
       });
       return;
@@ -1058,7 +954,7 @@ exports.processInvoiceDocument = functions
     if (!bucketName) {
       await change.after.ref.update({
         status: INVOICE_STATUS.error,
-        errorMessage: 'Missing bucket configuration for invoice processing.',
+        errorMessage: 'Λείπει η ρύθμιση του bucket για την επεξεργασία τιμολογίου.',
         updatedAt: serverTimestamp()
       });
       return;
@@ -1071,7 +967,7 @@ exports.processInvoiceDocument = functions
     if (!pages.length) {
       await change.after.ref.update({
         status: INVOICE_STATUS.error,
-        errorMessage: 'No pages were uploaded for this invoice.',
+        errorMessage: 'Δεν έγινε ανέβασμα τιμολογίου.',
         updatedAt: serverTimestamp()
       });
       return;
@@ -1080,11 +976,15 @@ exports.processInvoiceDocument = functions
     if (invoiceData.totalPages && pages.length !== invoiceData.totalPages) {
       await change.after.ref.update({
         status: INVOICE_STATUS.error,
-        errorMessage: `Expected ${invoiceData.totalPages} pages but found ${pages.length}.`,
+        errorMessage: `Αναμενόταν ${invoiceData.totalPages} σελίδες αλλά βρέθηκαν ${pages.length}.`,
         updatedAt: serverTimestamp()
       });
       return;
     }
+
+    // Declare outside try block so they're accessible in catch for error formatting
+    let supplierName = null;
+    let invoiceNumber = null;
 
     try {
       const { combinedPdfBuffer, downloadedPages } = await buildCombinedPdfFromPages(
@@ -1110,7 +1010,7 @@ exports.processInvoiceDocument = functions
         );
       }
 
-      const ocrResult = await runInvoiceOcr(pagesToOcr);
+    const ocrResult = await runInvoiceOcr(pagesToOcr);
       if (!ocrResult) {
         throw new Error('OCR result was empty.');
       }
@@ -1124,14 +1024,13 @@ exports.processInvoiceDocument = functions
       console.log('OCR extraction (GR):', JSON.stringify(ocrResult, null, 2));
       console.log('OCR extraction (EN):', JSON.stringify(mappedResult, null, 2));
 
-      const supplierName = mappedResult.supplierName || 'Unknown Supplier';
+      supplierName = mappedResult.supplierName || 'Unknown Supplier';
       const supplierTaxNumber = mappedResult.supplierTaxNumber || null;
       const supplierId = sanitizeId(
         supplierTaxNumber,
         sanitizeId(supplierName, 'unknown-supplier')
       );
-      const invoiceNumber =
-        mappedResult.invoiceNumber?.toString().match(/\d+/g)?.join('') || null;
+      invoiceNumber = mappedResult.invoiceNumber?.toString().match(/\d+/g)?.join('') || null;
       const uploadedBy = invoiceData.ownerUid || null;
       await ensureSupplierProfile({
         supplierId,
@@ -1139,6 +1038,36 @@ exports.processInvoiceDocument = functions
         supplierTaxNumber,
         supplierCategory: mappedResult.supplierCategory || null
       });
+
+      // Check for duplicate invoice (same supplier + invoice number)
+      if (invoiceNumber && supplierId) {
+        const duplicateQuery = await db
+          .collection('suppliers')
+          .doc(supplierId)
+          .collection('invoices')
+          .where('invoiceNumber', '==', invoiceNumber)
+          .limit(1)
+          .get();
+
+        if (!duplicateQuery.empty) {
+          const existingInvoice = duplicateQuery.docs[0];
+          const baseError = `Διπλότυπο τιμολόγιο (υπάρχον: ${existingInvoice.id})`;
+          const errorMessage = formatMetadataError(invoiceNumber, supplierName, baseError);
+          
+          console.error(errorMessage);
+          
+          await change.after.ref.update({
+            status: INVOICE_STATUS.error,
+            errorMessage,
+            duplicateOf: existingInvoice.id,
+            detectedInvoiceNumber: invoiceNumber,
+            detectedSupplierId: supplierId,
+            updatedAt: serverTimestamp()
+          });
+
+          return;
+        }
+      }
 
       const pdfObjectPath = `suppliers/${supplierId}/invoices/${invoiceId}.pdf`;
       try {
@@ -1159,6 +1088,23 @@ exports.processInvoiceDocument = functions
       }
 
       const invoiceDocRef = db.doc(`suppliers/${supplierId}/invoices/${invoiceId}`);
+      
+      // Store original OCR data for reference when user edits fields
+      const ocrData = {
+        supplierName,
+        supplierTaxNumber,
+        invoiceNumber,
+        invoiceDate: mappedResult.invoiceDate || null,
+        dueDate: mappedResult.dueDate || null,
+        totalAmount: mappedResult.totalAmount || null,
+        currency: mappedResult.currency || 'EUR',
+        netAmount: mappedResult.netAmount || null,
+        vatAmount: mappedResult.vat || null,
+        vatRate: mappedResult.vatRate || null,
+        confidence: mappedResult.confidence ? Number(mappedResult.confidence) : null,
+        extractedAt: admin.firestore.Timestamp.now()
+      };
+
       const invoicePayload = {
         invoiceId,
         rawFilePaths: pages.map((p) => p.objectName),
@@ -1181,6 +1127,7 @@ exports.processInvoiceDocument = functions
         unpaidAmount: parseAmount(mappedResult.totalAmount),
         errorMessage: null,
         confidence: mappedResult.confidence ? Number(mappedResult.confidence) : null,
+        ocr: ocrData,
         createdAt: invoiceData.createdAt || serverTimestamp(),
         uploadedAt: serverTimestamp()
       };
@@ -1193,38 +1140,24 @@ exports.processInvoiceDocument = functions
         processedInvoicePath: invoiceDocRef.path,
         confidence: invoicePayload.confidence,
         errorMessage: null,
+        successMessage: formatMetadataSuccess(invoiceNumber, supplierName),
         updatedAt: serverTimestamp()
       });
 
       console.log(`Stored invoice data at ${invoiceDocRef.path}`);
 
-      // Send FCM notification on success
-      if (uploadedBy) {
-        await sendInvoiceNotification(uploadedBy, {
-          invoiceId,
-          status: 'done',
-          supplierId,
-          supplierName,
-          invoiceNumber: invoiceNumber || ''
-        });
-      }
+      // TODO: send notification on success
     } catch (error) {
-      console.error(`Failed to process invoice ${invoiceId}:`, error);
+      const baseError = `Αδυναμία επεξεργασίας τιμολογίου με id: ${invoiceId}. Σφάλμα: ${error.message}`;
+      const errorMessage = formatMetadataError(invoiceNumber, supplierName, baseError);
+      console.error(errorMessage);
       await change.after.ref.update({
         status: INVOICE_STATUS.error,
-        errorMessage: error.message,
+        errorMessage,
         updatedAt: serverTimestamp()
       });
 
-      // Send FCM notification on error
-      const ownerUid = invoiceData?.ownerUid;
-      if (ownerUid) {
-        await sendInvoiceNotification(ownerUid, {
-          invoiceId,
-          status: 'error',
-          errorMessage: error.message
-        });
-      }
+      // TODO: send notification on error
     }
   });
 
@@ -1332,6 +1265,7 @@ function derivePaymentStatus(paidAmount, totalAmount) {
 }
 
 exports.updatePaymentStatus = functions
+  .region(REGION)
   .runWith({ serviceAccount: SERVICE_ACCOUNT_EMAIL })
   .https.onRequest(async (req, res) => {
     // CORS headers
@@ -1489,26 +1423,324 @@ exports.updatePaymentStatus = functions
   });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// FCM TOKEN REGISTRATION
+// UPDATE INVOICE FIELDS
 // ═══════════════════════════════════════════════════════════════════════════════
 //
-// Registers or updates an FCM token for push notifications.
+// Updates editable invoice fields. Recalculates payment status when amounts change.
 //
 // Request Body:
 // {
-//   token: string,              // Required - FCM registration token
-//   platform: string            // Optional - "ios" | "android" | "web"
+//   supplierId: string,           // Required - supplier identifier
+//   invoiceId: string,            // Required - invoice document ID
+//   fields: {                     // Required - fields to update (all optional)
+//     supplierName?: string,
+//     supplierTaxNumber?: string,
+//     invoiceNumber?: string,
+//     invoiceDate?: string,       // ISO date string
+//     dueDate?: string,           // ISO date string
+//     totalAmount?: number,
+//     netAmount?: number,
+//     vatAmount?: number,
+//     vatRate?: number,
+//     currency?: string,
+//     paidAmount?: number         // Will recalculate unpaidAmount & paymentStatus
+//   }
+// }
+//
+// Security:
+// - Requires Firebase Authentication
+// - Atomic updates via Firestore transaction
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Allowed fields that can be edited by the user
+const EDITABLE_INVOICE_FIELDS = [
+  'supplierName',
+  'supplierTaxNumber',
+  'invoiceNumber',
+  'invoiceDate',
+  'dueDate',
+  'totalAmount',
+  'netAmount',
+  'vatAmount',
+  'vatRate',
+  'paidAmount'
+];
+
+/**
+ * Validates update invoice fields request body
+ */
+function validateUpdateFieldsRequest(body) {
+  const errors = [];
+
+  if (!body.supplierId || typeof body.supplierId !== 'string') {
+    errors.push('supplierId is required and must be a string');
+  }
+
+  if (!body.invoiceId || typeof body.invoiceId !== 'string') {
+    errors.push('invoiceId is required and must be a string');
+  }
+
+  if (!body.fields || typeof body.fields !== 'object') {
+    errors.push('fields is required and must be an object');
+    return errors;
+  }
+
+  const fields = body.fields;
+
+  // Validate field types
+  if (fields.supplierName !== undefined && typeof fields.supplierName !== 'string') {
+    errors.push('fields.supplierName must be a string');
+  }
+
+  if (fields.supplierTaxNumber !== undefined && typeof fields.supplierTaxNumber !== 'string') {
+    errors.push('fields.supplierTaxNumber must be a string');
+  }
+
+  if (fields.invoiceNumber !== undefined && typeof fields.invoiceNumber !== 'string') {
+    errors.push('fields.invoiceNumber must be a string');
+  }
+
+  if (fields.currency !== undefined && typeof fields.currency !== 'string') {
+    errors.push('fields.currency must be a string');
+  }
+
+  // Validate date fields
+  if (fields.invoiceDate !== undefined) {
+    const date = new Date(fields.invoiceDate);
+    if (isNaN(date.getTime())) {
+      errors.push('fields.invoiceDate must be a valid ISO date string');
+    }
+  }
+
+  if (fields.dueDate !== undefined) {
+    const date = new Date(fields.dueDate);
+    if (isNaN(date.getTime())) {
+      errors.push('fields.dueDate must be a valid ISO date string');
+    }
+  }
+
+  // Validate numeric fields
+  const numericFields = ['totalAmount', 'netAmount', 'vatAmount', 'vatRate', 'paidAmount'];
+  for (const field of numericFields) {
+    if (fields[field] !== undefined) {
+      if (typeof fields[field] !== 'number' || isNaN(fields[field])) {
+        errors.push(`fields.${field} must be a valid number`);
+      } else if (fields[field] < 0) {
+        errors.push(`fields.${field} must be non-negative`);
+      }
+    }
+  }
+
+  // Check for unknown fields
+  const providedFields = Object.keys(fields);
+  const unknownFields = providedFields.filter(f => !EDITABLE_INVOICE_FIELDS.includes(f));
+  if (unknownFields.length > 0) {
+    errors.push(`Unknown fields: ${unknownFields.join(', ')}. Allowed: ${EDITABLE_INVOICE_FIELDS.join(', ')}`);
+  }
+
+  return errors;
+}
+
+exports.updateInvoiceFields = functions
+  .region(REGION)
+  .runWith({ serviceAccount: SERVICE_ACCOUNT_EMAIL })
+  .https.onRequest(async (req, res) => {
+    // CORS headers
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
+    if (req.method === 'OPTIONS') {
+      return res.status(204).send('');
+    }
+
+    if (req.method !== 'POST') {
+      return res.status(405).json({ error: 'Method not allowed. Use POST.' });
+    }
+
+    // 1. Authenticate
+    const authResult = await authenticateRequest(req);
+    if (authResult.error) {
+      return res.status(authResult.status).json({ error: authResult.error });
+    }
+    const user = authResult.user;
+
+    // 2. Validate request body
+    const body = req.body || {};
+    const validationErrors = validateUpdateFieldsRequest(body);
+    if (validationErrors.length > 0) {
+      return res.status(400).json({
+        error: 'Validation failed',
+        details: validationErrors
+      });
+    }
+
+    const { supplierId, invoiceId, fields } = body;
+
+    const invoiceRef = db
+      .collection('suppliers')
+      .doc(supplierId)
+      .collection('invoices')
+      .doc(invoiceId);
+
+    try {
+      const result = await db.runTransaction(async (tx) => {
+        const invoiceSnap = await tx.get(invoiceRef);
+
+        // 3. Check invoice exists
+        if (!invoiceSnap.exists) {
+          throw Object.assign(
+            new Error(`Invoice not found: suppliers/${supplierId}/invoices/${invoiceId}`),
+            { httpStatus: 404 }
+          );
+        }
+
+        const invoiceData = invoiceSnap.data();
+
+        // 4. Build update object
+        const updates = {
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          lastEditedBy: user.uid,
+          lastEditedAt: admin.firestore.FieldValue.serverTimestamp()
+        };
+
+        // Track which fields are being updated
+        const updatedFields = [];
+
+        // Process string fields
+        if (fields.supplierName !== undefined) {
+          updates.supplierName = fields.supplierName;
+          updatedFields.push('supplierName');
+        }
+        if (fields.supplierTaxNumber !== undefined) {
+          updates.supplierTaxNumber = fields.supplierTaxNumber;
+          updatedFields.push('supplierTaxNumber');
+        }
+        if (fields.invoiceNumber !== undefined) {
+          updates.invoiceNumber = fields.invoiceNumber;
+          updatedFields.push('invoiceNumber');
+        }
+        if (fields.currency !== undefined) {
+          updates.currency = fields.currency;
+          updatedFields.push('currency');
+        }
+
+        // Process date fields
+        if (fields.invoiceDate !== undefined) {
+          updates.invoiceDate = admin.firestore.Timestamp.fromDate(new Date(fields.invoiceDate));
+          updatedFields.push('invoiceDate');
+        }
+        if (fields.dueDate !== undefined) {
+          updates.dueDate = admin.firestore.Timestamp.fromDate(new Date(fields.dueDate));
+          updatedFields.push('dueDate');
+        }
+
+        // Process numeric fields
+        if (fields.netAmount !== undefined) {
+          updates.netAmount = fields.netAmount;
+          updatedFields.push('netAmount');
+        }
+        if (fields.vatAmount !== undefined) {
+          updates.vatAmount = fields.vatAmount;
+          updatedFields.push('vatAmount');
+        }
+        if (fields.vatRate !== undefined) {
+          updates.vatRate = fields.vatRate;
+          updatedFields.push('vatRate');
+        }
+
+        // 5. Handle amount changes with payment recalculation
+        const currentTotalAmount = invoiceData.totalAmount || 0;
+        const currentPaidAmount = invoiceData.paidAmount || 0;
+
+        let newTotalAmount = currentTotalAmount;
+        let newPaidAmount = currentPaidAmount;
+
+        if (fields.totalAmount !== undefined) {
+          newTotalAmount = fields.totalAmount;
+          updates.totalAmount = newTotalAmount;
+          updatedFields.push('totalAmount');
+        }
+
+        if (fields.paidAmount !== undefined) {
+          newPaidAmount = fields.paidAmount;
+          updates.paidAmount = newPaidAmount;
+          updatedFields.push('paidAmount');
+        }
+
+        // Recalculate unpaidAmount and paymentStatus if amounts changed
+        if (fields.totalAmount !== undefined || fields.paidAmount !== undefined) {
+          // Validate paidAmount doesn't exceed totalAmount
+          if (newPaidAmount > newTotalAmount + 0.01) {
+            throw Object.assign(
+              new Error(`paidAmount (${newPaidAmount.toFixed(2)}) cannot exceed totalAmount (${newTotalAmount.toFixed(2)})`),
+              { httpStatus: 400 }
+            );
+          }
+
+          updates.unpaidAmount = Math.max(0, newTotalAmount - newPaidAmount);
+          updates.paymentStatus = derivePaymentStatus(newPaidAmount, newTotalAmount);
+        }
+
+        // 6. Update invoice document
+        tx.update(invoiceRef, updates);
+
+        return {
+          invoiceId,
+          supplierId,
+          updatedFields,
+          totalAmount: newTotalAmount,
+          paidAmount: newPaidAmount,
+          unpaidAmount: updates.unpaidAmount !== undefined ? updates.unpaidAmount : (invoiceData.unpaidAmount || 0),
+          paymentStatus: updates.paymentStatus || invoiceData.paymentStatus
+        };
+      });
+
+      console.log(`Invoice fields updated for ${invoiceId}:`, result.updatedFields);
+
+      return res.status(200).json({
+        success: true,
+        message: `Updated ${result.updatedFields.length} field(s): ${result.updatedFields.join(', ')}`,
+        data: result
+      });
+
+    } catch (error) {
+      console.error('Invoice field update failed:', error);
+
+      const httpStatus = error.httpStatus || 500;
+      return res.status(httpStatus).json({
+        error: error.message,
+        code: httpStatus === 500 ? 'INTERNAL_ERROR' : 'UPDATE_ERROR'
+      });
+    }
+  });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SIGNED DOWNLOAD URL
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Generates a signed URL for downloading an invoice PDF from Cloud Storage.
+//
+// Request Body:
+// {
+//   filePath: string           // Required - path to file in storage (e.g. "suppliers/abc/invoices/xyz.pdf")
 // }
 //
 // Response:
-// { success: true, tokenId: "abc123" }
+// {
+//   downloadUrl: string,       // Signed URL for downloading
+//   expiresAt: string          // ISO timestamp when URL expires
+// }
 //
+// Security:
+// - Requires Firebase Authentication (any authenticated user can download)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-exports.registerFcmToken = functions
+exports.getSignedDownloadUrl = functions
+  .region(REGION)
   .runWith({ serviceAccount: SERVICE_ACCOUNT_EMAIL })
   .https.onRequest(async (req, res) => {
-    // CORS
+    // CORS headers
     res.set('Access-Control-Allow-Origin', '*');
     res.set('Access-Control-Allow-Headers', 'Authorization, Content-Type');
     res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
@@ -1518,7 +1750,7 @@ exports.registerFcmToken = functions
     }
 
     if (req.method !== 'POST') {
-      return res.status(405).json({ error: 'Method not allowed' });
+      return res.status(405).json({ error: 'Method not allowed. Use POST.' });
     }
 
     // Authenticate
@@ -1531,142 +1763,53 @@ exports.registerFcmToken = functions
     try {
       decodedToken = await admin.auth().verifyIdToken(idToken);
     } catch (error) {
-      return res.status(401).json({ error: 'Invalid or expired token', details: error.message });
+      return res.status(401).json({
+        error: 'Invalid or expired Firebase ID token',
+        details: error.message
+      });
     }
 
-    const userId = decodedToken.uid;
+    const { filePath } = req.body || {};
 
-    // Validate input
-    const { token, platform } = req.body || {};
-    if (!token || typeof token !== 'string') {
-      return res.status(400).json({ error: 'token is required and must be a string' });
+    if (!filePath || typeof filePath !== 'string') {
+      return res.status(400).json({ error: 'filePath is required and must be a string' });
     }
 
-    // Generate a stable token ID (hash of the token)
-    const tokenId = crypto.createHash('sha256').update(token).digest('hex').substring(0, 16);
-
-    const userRef = db.doc(`${USERS_COLLECTION}/${userId}`);
+    const bucketName = getBucketName();
+    if (!bucketName) {
+      return res.status(500).json({ error: 'Missing GCS bucket configuration' });
+    }
 
     try {
-      await db.runTransaction(async (tx) => {
-        const userDoc = await tx.get(userRef);
+      // Check if file exists
+      const file = storage.bucket(bucketName).file(filePath);
+      const [exists] = await file.exists();
 
-        const tokenData = {
-          token,
-          platform: platform || 'unknown',
-          createdAt: admin.firestore.Timestamp.now(),
-          lastActiveAt: admin.firestore.Timestamp.now()
-        };
+      if (!exists) {
+        return res.status(404).json({ error: 'File not found' });
+      }
 
-        if (!userDoc.exists) {
-          // Create user document with FCM token
-          tx.set(userRef, {
-            fcmTokens: { [tokenId]: tokenData },
-            createdAt: serverTimestamp(),
-            updatedAt: serverTimestamp()
-          });
-        } else {
-          // Update existing user with new/updated token
-          tx.update(userRef, {
-            [`fcmTokens.${tokenId}`]: tokenData,
-            updatedAt: serverTimestamp()
-          });
-        }
+      // Generate signed URL for reading/downloading
+      const expiresAtMs = Date.now() + SIGNED_URL_TTL_MS;
+
+      const [downloadUrl] = await file.getSignedUrl({
+        version: 'v4',
+        action: 'read',
+        expires: expiresAtMs
       });
 
-      console.log(`FCM token registered for user ${userId}: ${tokenId}`);
-      return res.status(200).json({ success: true, tokenId });
+      return res.status(200).json({
+        downloadUrl,
+        filePath,
+        bucket: bucketName,
+        expiresAt: new Date(expiresAtMs).toISOString()
+      });
 
     } catch (error) {
-      console.error(`Failed to register FCM token for user ${userId}:`, error);
-      return res.status(500).json({ error: 'Failed to register token', details: error.message });
+      console.error('Failed to generate signed download URL:', error);
+      return res.status(500).json({
+        error: 'Failed to generate download URL',
+        details: error.message
+      });
     }
-  });
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// FCM TOKEN CLEANUP (Scheduled - Weekly)
-// ═══════════════════════════════════════════════════════════════════════════════
-//
-// Removes FCM tokens that haven't been active in the last 60 days.
-// Runs every Sunday at 3:00 AM UTC.
-//
-// ═══════════════════════════════════════════════════════════════════════════════
-
-exports.cleanupStaleTokens = functions
-  .runWith({ serviceAccount: SERVICE_ACCOUNT_EMAIL })
-  .pubsub.schedule('0 3 * * 0') // Every Sunday at 3:00 AM UTC
-  .timeZone('UTC')
-  .onRun(async () => {
-    const cutoffDate = new Date(Date.now() - FCM_TOKEN_STALE_DAYS * 24 * 60 * 60 * 1000);
-    const cutoffTimestamp = admin.firestore.Timestamp.fromDate(cutoffDate);
-
-    console.log(`Starting FCM token cleanup. Removing tokens inactive since ${cutoffDate.toISOString()}`);
-
-    let totalUsersProcessed = 0;
-    let totalTokensRemoved = 0;
-
-    // Process users in batches
-    let lastDoc = null;
-    const batchSize = 100;
-
-    while (true) {
-      let query = db.collection(USERS_COLLECTION)
-        .orderBy('__name__')
-        .limit(batchSize);
-
-      if (lastDoc) {
-        query = query.startAfter(lastDoc);
-      }
-
-      const snapshot = await query.get();
-
-      if (snapshot.empty) {
-        break;
-      }
-
-      const batch = db.batch();
-      let batchHasUpdates = false;
-
-      for (const doc of snapshot.docs) {
-        const userData = doc.data();
-        const fcmTokens = userData.fcmTokens || {};
-        const tokensToDelete = [];
-
-        for (const [tokenId, tokenData] of Object.entries(fcmTokens)) {
-          const lastActiveAt = tokenData?.lastActiveAt;
-          
-          // Delete if no lastActiveAt or if it's older than cutoff
-          if (!lastActiveAt || lastActiveAt.toDate() < cutoffDate) {
-            tokensToDelete.push(tokenId);
-          }
-        }
-
-        if (tokensToDelete.length > 0) {
-          const updates = {};
-          for (const tokenId of tokensToDelete) {
-            updates[`fcmTokens.${tokenId}`] = admin.firestore.FieldValue.delete();
-          }
-          updates.updatedAt = serverTimestamp();
-
-          batch.update(doc.ref, updates);
-          batchHasUpdates = true;
-          totalTokensRemoved += tokensToDelete.length;
-        }
-
-        totalUsersProcessed++;
-        lastDoc = doc;
-      }
-
-      if (batchHasUpdates) {
-        await batch.commit();
-      }
-
-      // If we got fewer than batchSize, we're done
-      if (snapshot.docs.length < batchSize) {
-        break;
-      }
-    }
-
-    console.log(`FCM token cleanup complete. Processed ${totalUsersProcessed} users, removed ${totalTokensRemoved} stale tokens.`);
-    return null;
   });

@@ -1,0 +1,14 @@
+{
+  "openai": {
+    "key": "<..>"
+  },
+  "uploads": {
+    "bucket": "clean-abacus-482115-a1.firebasestorage.app"
+  },
+  "serviceaccount": {
+    "email": "firebase-adminsdk-fbsvc@clean-abacus-482115-a1.iam.gserviceaccount.com"
+  },
+  "region": {
+    "name": "europe-west8"
+  }
+}
