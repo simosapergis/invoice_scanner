@@ -119,3 +119,40 @@ firebase deploy --only functions --project level-approach-479119-b3
 # Deploy specific function (e.g getSignedUploadUrl)
 firebase deploy --only functions:getSignedUploadUrl
 ```
+
+# Extract current rules and indexes from google console
+firebase init firestore
+
+# Deploy firestore rules and indexes [firestore.rules, firestore.indexes.json] referenced in firebase.json
+firebase deploy --only firestore:rules,firestore:indexes
+
+# Export Cloud Functions runtime config / env  (Legacy)
+firebase functions:config:get > functions.config.json
+
+# Deploy cloud functions
+
+
+###### Starting a new project (clone) ######
+
+# 0. Create bucket
+gcloud storage buckets create gs://${PROJECT_NAME} \
+  --location=europe-west8 \
+  --uniform-bucket-level-access
+
+# 1. Point to prod in .firebaserc
+firebase use prod
+
+# 2. Verify selected project
+firebase use 
+
+# 3. Create rules/indexes for firestore (no collection needs to be created prior)
+firebase deploy --only firestore:rules,firestore:indexes
+
+# 4. Set functions config (v1)
+firebase functions:config:set uploads.bucket="level-approach-479119-b3.firebasestorage.app"
+firebase functions:config:set serviceAccount.email="mylogia@level-approach-479119-b3.iam.gserviceaccount.com"
+firebase functions:config:set region.name="europe-west8"
+firebase functions:config:set openai.key="<..>"
+
+# 5. Deploy functions
+firebase deploy --only functions

@@ -13,7 +13,12 @@ const visionClient = new vision.ImageAnnotatorClient();
 const db = admin.firestore();
 const UPLOADS_PREFIX = 'uploads/';
 const METADATA_INVOICE_COLLECTION = 'metadata_invoices';
-const SERVICE_ACCOUNT_EMAIL = 'mylogia@level-approach-479119-b3.iam.gserviceaccount.com';
+const SERVICE_ACCOUNT_EMAIL = functions.config().serviceAccount?.email || process.env.SERVICE_ACCOUNT_EMAIL;
+const REGION = functions.config().region?.name || process.env.REGION;
+
+console.log('env SERVICE_ACCOUNT_EMAIL', SERVICE_ACCOUNT_EMAIL);
+console.log('env REGION', REGION);
+
 const SIGNED_URL_TTL_MS = 15 * 60 * 1000;
 const INVOICE_STATUS = {
   pending: 'pending',
@@ -753,6 +758,7 @@ async function runInvoiceOcrAttempt(pageBuffers) {
 
 //exports.getSignedUploadUrl = functions.region('europe-west8').https.onRequest(async (req, res) => {
 exports.getSignedUploadUrl = functions
+  .region(REGION)
   .runWith({ serviceAccount: SERVICE_ACCOUNT_EMAIL })
   .https.onRequest(async (req, res) => {
   res.set('Access-Control-Allow-Origin', '*');
@@ -846,6 +852,7 @@ exports.getSignedUploadUrl = functions
 });
 
 exports.processUploadedInvoice = functions
+  .region(REGION)
   .runWith({ serviceAccount: SERVICE_ACCOUNT_EMAIL })
   .storage.object()
   .onFinalize(async (object) => {
@@ -886,6 +893,7 @@ exports.processUploadedInvoice = functions
 });
 
 exports.processInvoiceDocument = functions
+  .region(REGION)
   .runWith({ serviceAccount: SERVICE_ACCOUNT_EMAIL })
   .firestore.document(`${METADATA_INVOICE_COLLECTION}/{invoiceId}`)
   .onWrite(async (change, context) => {
@@ -1031,13 +1039,14 @@ exports.processInvoiceDocument = functions
         supplierCategory: mappedResult.supplierCategory || null
       });
 
-      // Check for duplicate invoice (same supplier + invoice number)
+      // Check for duplicate invoice (same supplier + invoice number, only against done invoices)
       if (invoiceNumber && supplierId) {
         const duplicateQuery = await db
           .collection('suppliers')
           .doc(supplierId)
           .collection('invoices')
           .where('invoiceNumber', '==', invoiceNumber)
+          .where('processingStatus', '==', INVOICE_STATUS.uploaded)
           .limit(1)
           .get();
 
@@ -1257,6 +1266,7 @@ function derivePaymentStatus(paidAmount, totalAmount) {
 }
 
 exports.updatePaymentStatus = functions
+  .region(REGION)
   .runWith({ serviceAccount: SERVICE_ACCOUNT_EMAIL })
   .https.onRequest(async (req, res) => {
     // CORS headers
@@ -1533,6 +1543,7 @@ function validateUpdateFieldsRequest(body) {
 }
 
 exports.updateInvoiceFields = functions
+  .region(REGION)
   .runWith({ serviceAccount: SERVICE_ACCOUNT_EMAIL })
   .https.onRequest(async (req, res) => {
     // CORS headers
@@ -1727,6 +1738,7 @@ exports.updateInvoiceFields = functions
 // ═══════════════════════════════════════════════════════════════════════════════
 
 exports.getSignedDownloadUrl = functions
+  .region(REGION)
   .runWith({ serviceAccount: SERVICE_ACCOUNT_EMAIL })
   .https.onRequest(async (req, res) => {
     // CORS headers

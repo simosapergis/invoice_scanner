@@ -1,0 +1,14 @@
+{
+  "openai": {
+    "key": "<..>"
+  },
+  "uploads": {
+    "bucket": "level-approach-479119-b3.firebasestorage.app"
+  },
+  "serviceAccount": {
+    "email": "mylogia@level-approach-479119-b3.iam.gserviceaccount.com"
+  },
+  "region": {
+    "name": "europe-west8"
+  }
+}
