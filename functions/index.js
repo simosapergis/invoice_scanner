@@ -13,7 +13,7 @@ const visionClient = new vision.ImageAnnotatorClient();
 const db = admin.firestore();
 const UPLOADS_PREFIX = 'uploads/';
 const METADATA_INVOICE_COLLECTION = 'metadata_invoices';
-const SERVICE_ACCOUNT_EMAIL = functions.config().serviceAccount?.email || process.env.SERVICE_ACCOUNT_EMAIL;
+const SERVICE_ACCOUNT_EMAIL = functions.config().serviceaccount?.email || process.env.SERVICE_ACCOUNT_EMAIL;
 const REGION = functions.config().region?.name || process.env.REGION;
 
 console.log('env SERVICE_ACCOUNT_EMAIL', SERVICE_ACCOUNT_EMAIL);
