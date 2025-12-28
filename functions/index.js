@@ -1039,13 +1039,14 @@ exports.processInvoiceDocument = functions
         supplierCategory: mappedResult.supplierCategory || null
       });
 
-      // Check for duplicate invoice (same supplier + invoice number)
+      // Check for duplicate invoice (same supplier + invoice number, only against done invoices)
       if (invoiceNumber && supplierId) {
         const duplicateQuery = await db
           .collection('suppliers')
           .doc(supplierId)
           .collection('invoices')
           .where('invoiceNumber', '==', invoiceNumber)
+          .where('processingStatus', '==', INVOICE_STATUS.uploaded)
           .limit(1)
           .get();
 
