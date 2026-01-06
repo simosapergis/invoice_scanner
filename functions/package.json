@@ -5,7 +5,7 @@
     "@google-cloud/storage": "^7.11.1",
     "@google-cloud/vision": "^5.3.4",
     "firebase-admin": "^12.1.1",
-    "firebase-functions": "^4.4.1",
+    "firebase-functions": "^7.0.2",
     "openai": "^4.77.0",
     "pdf-lib": "^1.17.1"
   },

@@ -1717,6 +1717,249 @@ exports.updateInvoiceFields = functions
   });
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// UPDATE SUPPLIER FIELDS
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Updates editable supplier fields at /suppliers/{supplierId}
+//
+// Request Body:
+// {
+//   supplierId: string,           // Required - supplier identifier
+//   fields: {                     // Required - fields to update (all optional)
+//     name?: string,
+//     supplierCategory?: string,
+//     supplierTaxNumber?: string, // Numbers only
+//     delivery?: {
+//       dayOfWeek: number,        // 1-7 (ISO 8601: Mon-Sun)
+//       from: { hour: number, minute: number },
+//       to: { hour: number, minute: number }
+//     }
+//   }
+// }
+//
+// Security:
+// - Requires Firebase Authentication
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const EDITABLE_SUPPLIER_FIELDS = ['name', 'supplierCategory', 'supplierTaxNumber', 'delivery'];
+
+/**
+ * Validates a time object { hour, minute }
+ */
+function validateTimeObject(time, fieldName, errors) {
+  if (typeof time !== 'object' || time === null) {
+    errors.push(`${fieldName} must be an object with hour and minute`);
+    return false;
+  }
+
+  if (typeof time.hour !== 'number' || !Number.isInteger(time.hour) || time.hour < 0 || time.hour > 23) {
+    errors.push(`${fieldName}.hour must be an integer between 0 and 23`);
+  }
+
+  if (typeof time.minute !== 'number' || !Number.isInteger(time.minute) || time.minute < 0 || time.minute > 59) {
+    errors.push(`${fieldName}.minute must be an integer between 0 and 59`);
+  }
+
+  return true;
+}
+
+/**
+ * Validates the delivery object
+ */
+function validateDeliveryObject(delivery, errors) {
+  if (typeof delivery !== 'object' || delivery === null) {
+    errors.push('fields.delivery must be an object');
+    return;
+  }
+
+  // Validate dayOfWeek (1-7, ISO 8601)
+  if (delivery.dayOfWeek !== undefined) {
+    if (typeof delivery.dayOfWeek !== 'number' || !Number.isInteger(delivery.dayOfWeek) || delivery.dayOfWeek < 1 || delivery.dayOfWeek > 7) {
+      errors.push('fields.delivery.dayOfWeek must be an integer between 1 (Monday) and 7 (Sunday)');
+    }
+  }
+
+  // Validate from time
+  if (delivery.from !== undefined) {
+    validateTimeObject(delivery.from, 'fields.delivery.from', errors);
+  }
+
+  // Validate to time
+  if (delivery.to !== undefined) {
+    validateTimeObject(delivery.to, 'fields.delivery.to', errors);
+  }
+}
+
+/**
+ * Validates update supplier fields request body
+ */
+function validateUpdateSupplierRequest(body) {
+  const errors = [];
+
+  if (!body.supplierId || typeof body.supplierId !== 'string') {
+    errors.push('supplierId is required and must be a string');
+  }
+
+  if (!body.fields || typeof body.fields !== 'object') {
+    errors.push('fields is required and must be an object');
+    return errors;
+  }
+
+  const fields = body.fields;
+
+  // Validate name
+  if (fields.name !== undefined && typeof fields.name !== 'string') {
+    errors.push('fields.name must be a string');
+  }
+
+  // Validate supplierCategory
+  if (fields.supplierCategory !== undefined && typeof fields.supplierCategory !== 'string') {
+    errors.push('fields.supplierCategory must be a string');
+  }
+
+  // Validate supplierTaxNumber (string with numbers only)
+  if (fields.supplierTaxNumber !== undefined) {
+    if (typeof fields.supplierTaxNumber !== 'string') {
+      errors.push('fields.supplierTaxNumber must be a string');
+    } else if (!/^\d+$/.test(fields.supplierTaxNumber)) {
+      errors.push('fields.supplierTaxNumber must contain only digits');
+    }
+  }
+
+  // Validate delivery object
+  if (fields.delivery !== undefined) {
+    validateDeliveryObject(fields.delivery, errors);
+  }
+
+  // Check for unknown fields
+  const providedFields = Object.keys(fields);
+  const unknownFields = providedFields.filter(f => !EDITABLE_SUPPLIER_FIELDS.includes(f));
+  if (unknownFields.length > 0) {
+    errors.push(`Unknown fields: ${unknownFields.join(', ')}. Allowed: ${EDITABLE_SUPPLIER_FIELDS.join(', ')}`);
+  }
+
+  return errors;
+}
+
+exports.updateSupplierFields = functions
+  .region(REGION)
+  .runWith({ serviceAccount: SERVICE_ACCOUNT_EMAIL })
+  .https.onRequest(async (req, res) => {
+    // CORS headers
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
+    if (req.method === 'OPTIONS') {
+      return res.status(204).send('');
+    }
+
+    if (req.method !== 'POST') {
+      return res.status(405).json({ error: 'Method not allowed. Use POST.' });
+    }
+
+    // 1. Authenticate
+    const authResult = await authenticateRequest(req);
+    if (authResult.error) {
+      return res.status(authResult.status).json({ error: authResult.error });
+    }
+    const user = authResult.user;
+
+    // 2. Validate request body
+    const body = req.body || {};
+    const validationErrors = validateUpdateSupplierRequest(body);
+    if (validationErrors.length > 0) {
+      return res.status(400).json({
+        error: 'Validation failed',
+        details: validationErrors
+      });
+    }
+
+    const { supplierId, fields } = body;
+    const supplierRef = db.collection('suppliers').doc(supplierId);
+
+    try {
+      const result = await db.runTransaction(async (tx) => {
+        const supplierSnap = await tx.get(supplierRef);
+
+        // 3. Check supplier exists
+        if (!supplierSnap.exists) {
+          throw Object.assign(
+            new Error(`Supplier not found: suppliers/${supplierId}`),
+            { httpStatus: 404 }
+          );
+        }
+
+        // 4. Build update object
+        const updates = {
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          lastEditedBy: user.uid,
+          lastEditedAt: admin.firestore.FieldValue.serverTimestamp()
+        };
+
+        const updatedFields = [];
+
+        // Process string fields
+        if (fields.name !== undefined) {
+          updates.name = fields.name;
+          updatedFields.push('name');
+        }
+
+        if (fields.supplierCategory !== undefined) {
+          updates.supplierCategory = fields.supplierCategory;
+          updatedFields.push('supplierCategory');
+        }
+
+        if (fields.supplierTaxNumber !== undefined) {
+          updates.supplierTaxNumber = fields.supplierTaxNumber;
+          updatedFields.push('supplierTaxNumber');
+        }
+
+        // Process delivery object
+        if (fields.delivery !== undefined) {
+          updates.delivery = {
+            dayOfWeek: fields.delivery.dayOfWeek,
+            from: {
+              hour: fields.delivery.from?.hour,
+              minute: fields.delivery.from?.minute
+            },
+            to: {
+              hour: fields.delivery.to?.hour,
+              minute: fields.delivery.to?.minute
+            }
+          };
+          updatedFields.push('delivery');
+        }
+
+        // 5. Update supplier document
+        tx.update(supplierRef, updates);
+
+        return {
+          supplierId,
+          updatedFields
+        };
+      });
+
+      console.log(`Supplier fields updated for ${supplierId}:`, result.updatedFields);
+
+      return res.status(200).json({
+        success: true,
+        message: `Updated ${result.updatedFields.length} field(s): ${result.updatedFields.join(', ')}`,
+        data: result
+      });
+
+    } catch (error) {
+      console.error('Supplier field update failed:', error);
+
+      const httpStatus = error.httpStatus || 500;
+      return res.status(httpStatus).json({
+        error: error.message,
+        code: httpStatus === 500 ? 'INTERNAL_ERROR' : 'UPDATE_ERROR'
+      });
+    }
+  });
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // SIGNED DOWNLOAD URL
 // ═══════════════════════════════════════════════════════════════════════════════
 //
