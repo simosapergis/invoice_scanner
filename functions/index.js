@@ -13,11 +13,16 @@ const visionClient = new vision.ImageAnnotatorClient();
 const db = admin.firestore();
 const UPLOADS_PREFIX = 'uploads/';
 const METADATA_INVOICE_COLLECTION = 'metadata_invoices';
-const SERVICE_ACCOUNT_EMAIL = functions.config().serviceaccount?.email || process.env.SERVICE_ACCOUNT_EMAIL;
-const REGION = functions.config().region?.name || process.env.REGION;
+const SERVICE_ACCOUNT_EMAIL = process.env.SERVICE_ACCOUNT_EMAIL || undefined;
+const REGION = process.env.REGION || 'europe-west6';
 
 console.log('env SERVICE_ACCOUNT_EMAIL', SERVICE_ACCOUNT_EMAIL);
 console.log('env REGION', REGION);
+
+// Build runWith options - only include serviceAccount if defined
+const FUNCTION_OPTIONS = SERVICE_ACCOUNT_EMAIL 
+  ? { serviceAccount: SERVICE_ACCOUNT_EMAIL }
+  : {};
 
 const SIGNED_URL_TTL_MS = 15 * 60 * 1000;
 const INVOICE_STATUS = {
@@ -33,6 +38,47 @@ const PAYMENT_STATUS = {
   paid: 'paid',
   partiallyPaid: 'partially_paid'
 };
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FINANCIAL TRACKING CONSTANTS
+// ═══════════════════════════════════════════════════════════════════════════════
+const FINANCIAL_ENTRIES_COLLECTION = 'financial_entries';
+//TODO: add financial summaries collection in case there is a performance issue
+// const FINANCIAL_SUMMARIES_COLLECTION = 'financial_summaries'; 
+const RECURRING_EXPENSES_COLLECTION = 'recurring_expenses';
+
+const ENTRY_TYPE = {
+  income: 'income',
+  expense: 'expense'
+};
+
+const ENTRY_SOURCE = {
+  manual: 'manual',
+  invoicePayment: 'invoice_payment',
+  recurring: 'recurring'
+};
+
+// Income categories
+const INCOME_CATEGORY = {
+  cashSales: 'cash_sales',
+  cardSales: 'card_sales',
+  otherIncome: 'other_income'
+};
+
+// Expense categories - ΠΑΓΙΑ ΜΗΝΑ (Fixed Monthly) + Invoice Payments
+const EXPENSE_CATEGORY = {
+  electricity: 'ΡΕΥΜΑ',           // Electricity
+  telecom: 'ΤΗΛΕΦΩΝΙΑ',               // Telecom
+  rent: 'ΕΝΟΙΚΙΟ',              // Rent
+  salaries: 'ΜΙΣΘΟΙ',        // Staff/Salaries
+  accountant: 'ΛΟΓΙΣΤΗΣ',       // Accountant
+  invoicePayment: 'ΠΛΗΡΩΜΗ_ΤΙΜΟΛΟΓΙΟΥ',  // Invoice Payment (auto-generated)
+  other: 'ΑΛΛΑ'                 // Other
+};
+
+const VALID_INCOME_CATEGORIES = Object.values(INCOME_CATEGORY);
+const VALID_EXPENSE_CATEGORIES = Object.values(EXPENSE_CATEGORY);
+
 const serverTimestamp = admin.firestore.FieldValue.serverTimestamp;
 const REQUIRED_FIELDS = [
   'ΗΜΕΡΟΜΗΝΙΑ',
@@ -81,7 +127,7 @@ function formatMetadataSuccess(invoiceNumber, supplierName) {
       .replace('%s', supplierName);
 }
 
-const openAiApiKey = process.env.OPENAI_API_KEY || functions.config().openai?.key;
+const openAiApiKey = process.env.OPENAI_API_KEY;
 const openaiClient = openAiApiKey ? new OpenAI({ apiKey: openAiApiKey }) : null;
 const OCR_MAX_RETRIES = 3;
 
@@ -248,7 +294,7 @@ function parseJsonFromResponse(text) {
 }
 
 function getBucketName() {
-  return process.env.GCS_BUCKET || functions.config().uploads?.bucket;
+  return process.env.GCS_BUCKET;
 }
 
 function invoiceDocRef(invoiceId) {
@@ -759,7 +805,7 @@ async function runInvoiceOcrAttempt(pageBuffers) {
 //exports.getSignedUploadUrl = functions.region('europe-west8').https.onRequest(async (req, res) => {
 exports.getSignedUploadUrl = functions
   .region(REGION)
-  .runWith({ serviceAccount: SERVICE_ACCOUNT_EMAIL })
+  .runWith(FUNCTION_OPTIONS)
   .https.onRequest(async (req, res) => {
   res.set('Access-Control-Allow-Origin', '*');
   res.set('Access-Control-Allow-Headers', 'Authorization, Content-Type');
@@ -853,7 +899,7 @@ exports.getSignedUploadUrl = functions
 
 exports.processUploadedInvoice = functions
   .region(REGION)
-  .runWith({ serviceAccount: SERVICE_ACCOUNT_EMAIL })
+  .runWith(FUNCTION_OPTIONS)
   .storage.object()
   .onFinalize(async (object) => {
   const { name: objectName, bucket, contentType } = object;
@@ -894,7 +940,7 @@ exports.processUploadedInvoice = functions
 
 exports.processInvoiceDocument = functions
   .region(REGION)
-  .runWith({ serviceAccount: SERVICE_ACCOUNT_EMAIL })
+  .runWith(FUNCTION_OPTIONS)
   .firestore.document(`${METADATA_INVOICE_COLLECTION}/{invoiceId}`)
   .onWrite(async (change, context) => {
     const after = change.after.exists ? change.after.data() : null;
@@ -1010,7 +1056,7 @@ exports.processInvoiceDocument = functions
         );
       }
 
-    const ocrResult = await runInvoiceOcr(pagesToOcr);
+      const ocrResult = await runInvoiceOcr(pagesToOcr);
       if (!ocrResult) {
         throw new Error('OCR result was empty.');
       }
@@ -1267,7 +1313,7 @@ function derivePaymentStatus(paidAmount, totalAmount) {
 
 exports.updatePaymentStatus = functions
   .region(REGION)
-  .runWith({ serviceAccount: SERVICE_ACCOUNT_EMAIL })
+  .runWith(FUNCTION_OPTIONS)
   .https.onRequest(async (req, res) => {
     // CORS headers
     res.set('Access-Control-Allow-Origin', '*');
@@ -1393,9 +1439,12 @@ exports.updatePaymentStatus = functions
         return {
           invoiceId,
           supplierId,
+          supplierName: invoiceData.supplierName || null,
+          invoiceNumber: invoiceData.invoiceNumber || null,
           previousStatus: invoiceData.paymentStatus || PAYMENT_STATUS.unpaid,
           newStatus: newPaymentStatus,
           paymentAmount,
+          paymentDate,
           totalAmount,
           paidAmount: newPaidAmount,
           unpaidAmount: newUnpaidAmount
@@ -1403,6 +1452,34 @@ exports.updatePaymentStatus = functions
       });
 
       console.log(`Payment recorded for invoice ${invoiceId}:`, result);
+
+      // Auto-create expense entry for the payment
+      try {
+        const expenseEntry = {
+          type: ENTRY_TYPE.expense,
+          category: EXPENSE_CATEGORY.invoicePayment,
+          amount: result.paymentAmount,
+          date: result.paymentDate,
+          description: `Τιμολόγιο #${result.invoiceNumber || invoiceId} - ${result.supplierName || supplierId}`,
+          source: ENTRY_SOURCE.invoicePayment,
+          metadata: {
+            invoiceId,
+            supplierId,
+            supplierName: result.supplierName,
+            invoiceNumber: result.invoiceNumber
+          },
+          isDeleted: false,
+          createdBy: user.uid,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp()
+        };
+
+        const expenseRef = await db.collection(FINANCIAL_ENTRIES_COLLECTION).add(expenseEntry);
+        console.log(`Auto-created expense entry ${expenseRef.id} for invoice payment`);
+      } catch (expenseError) {
+        // Log but don't fail the payment - expense creation is secondary
+        console.error('Failed to auto-create expense entry for payment:', expenseError);
+      }
 
       return res.status(200).json({
         success: true,
@@ -1544,7 +1621,7 @@ function validateUpdateFieldsRequest(body) {
 
 exports.updateInvoiceFields = functions
   .region(REGION)
-  .runWith({ serviceAccount: SERVICE_ACCOUNT_EMAIL })
+  .runWith(FUNCTION_OPTIONS)
   .https.onRequest(async (req, res) => {
     // CORS headers
     res.set('Access-Control-Allow-Origin', '*');
@@ -1843,7 +1920,7 @@ function validateUpdateSupplierRequest(body) {
 
 exports.updateSupplierFields = functions
   .region(REGION)
-  .runWith({ serviceAccount: SERVICE_ACCOUNT_EMAIL })
+  .runWith(FUNCTION_OPTIONS)
   .https.onRequest(async (req, res) => {
     // CORS headers
     res.set('Access-Control-Allow-Origin', '*');
@@ -1982,7 +2059,7 @@ exports.updateSupplierFields = functions
 
 exports.getSignedDownloadUrl = functions
   .region(REGION)
-  .runWith({ serviceAccount: SERVICE_ACCOUNT_EMAIL })
+  .runWith(FUNCTION_OPTIONS)
   .https.onRequest(async (req, res) => {
     // CORS headers
     res.set('Access-Control-Allow-Origin', '*');
@@ -2053,6 +2130,687 @@ exports.getSignedDownloadUrl = functions
       console.error('Failed to generate signed download URL:', error);
       return res.status(500).json({
         error: 'Failed to generate download URL',
+        details: error.message
+      });
+    }
+  });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FINANCIAL TRACKING FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Validates financial entry request
+ */
+function validateFinancialEntryRequest(body) {
+  const errors = [];
+
+  // Validate type
+  if (!body.type || !Object.values(ENTRY_TYPE).includes(body.type)) {
+    errors.push(`type is required and must be one of: ${Object.values(ENTRY_TYPE).join(', ')}`);
+  }
+
+  // Validate category based on type
+  if (body.type === ENTRY_TYPE.income) {
+    if (!body.category || !VALID_INCOME_CATEGORIES.includes(body.category)) {
+      errors.push(`category for income must be one of: ${VALID_INCOME_CATEGORIES.join(', ')}`);
+    }
+  } else if (body.type === ENTRY_TYPE.expense) {
+    if (!body.category || !VALID_EXPENSE_CATEGORIES.includes(body.category)) {
+      errors.push(`category for expense must be one of: ${VALID_EXPENSE_CATEGORIES.join(', ')}`);
+    }
+  }
+
+  // Validate amount
+  if (typeof body.amount !== 'number' || body.amount <= 0) {
+    errors.push('amount is required and must be a positive number');
+  }
+
+  // Validate date
+  if (!body.date) {
+    errors.push('date is required');
+  } else {
+    const date = new Date(body.date);
+    if (isNaN(date.getTime())) {
+      errors.push('date must be a valid ISO date string');
+    }
+  }
+
+  // Validate description (optional but must be string if provided)
+  if (body.description !== undefined && typeof body.description !== 'string') {
+    errors.push('description must be a string');
+  }
+
+  return errors;
+}
+
+/**
+ * Creates a financial entry document
+ */
+function buildFinancialEntry({ type, category, amount, date, description, source, metadata, userId }) {
+  return {
+    type,
+    category,
+    amount,
+    date: admin.firestore.Timestamp.fromDate(new Date(date)),
+    description: description || null,
+    source: source || ENTRY_SOURCE.manual,
+    metadata: metadata || {},
+    isDeleted: false,
+    createdBy: userId,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp()
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ADD FINANCIAL ENTRY
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Adds a manual income or expense entry.
+//
+// Request Body:
+// {
+//   type: "income" | "expense",
+//   category: string,              // See INCOME_CATEGORY or EXPENSE_CATEGORY
+//   amount: number,
+//   date: string,                  // ISO date string (business date)
+//   description?: string
+// }
+// ═══════════════════════════════════════════════════════════════════════════════
+
+exports.addFinancialEntry = functions
+  .region(REGION)
+  .runWith(FUNCTION_OPTIONS)
+  .https.onRequest(async (req, res) => {
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
+    if (req.method === 'OPTIONS') {
+      return res.status(204).send('');
+    }
+
+    if (req.method !== 'POST') {
+      return res.status(405).json({ error: 'Method not allowed. Use POST.' });
+    }
+
+    // Authenticate
+    const authResult = await authenticateRequest(req);
+    if (authResult.error) {
+      return res.status(authResult.status).json({ error: authResult.error });
+    }
+    const user = authResult.user;
+
+    // Validate
+    const body = req.body || {};
+    const validationErrors = validateFinancialEntryRequest(body);
+    if (validationErrors.length > 0) {
+      return res.status(400).json({
+        error: 'Validation failed',
+        details: validationErrors
+      });
+    }
+
+    try {
+      const entry = buildFinancialEntry({
+        type: body.type,
+        category: body.category,
+        amount: body.amount,
+        date: body.date,
+        description: body.description,
+        source: ENTRY_SOURCE.manual,
+        userId: user.uid
+      });
+
+      const docRef = await db.collection(FINANCIAL_ENTRIES_COLLECTION).add(entry);
+
+      console.log(`Financial entry created: ${docRef.id} - ${body.type} ${body.category} ${body.amount}`);
+
+      return res.status(201).json({
+        success: true,
+        message: `${body.type === ENTRY_TYPE.income ? 'Έσοδο' : 'Έξοδο'} καταχωρήθηκε επιτυχώς`,
+        data: {
+          entryId: docRef.id,
+          ...entry,
+          date: body.date
+        }
+      });
+
+    } catch (error) {
+      console.error('Failed to add financial entry:', error);
+      return res.status(500).json({
+        error: 'Failed to add financial entry',
+        details: error.message
+      });
+    }
+  });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DELETE FINANCIAL ENTRY (Soft Delete)
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Soft deletes a financial entry.
+//
+// Request Body:
+// {
+//   entryId: string
+// }
+// ═══════════════════════════════════════════════════════════════════════════════
+
+exports.deleteFinancialEntry = functions
+  .region(REGION)
+  .runWith(FUNCTION_OPTIONS)
+  .https.onRequest(async (req, res) => {
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
+    if (req.method === 'OPTIONS') {
+      return res.status(204).send('');
+    }
+
+    if (req.method !== 'POST') {
+      return res.status(405).json({ error: 'Method not allowed. Use POST.' });
+    }
+
+    const authResult = await authenticateRequest(req);
+    if (authResult.error) {
+      return res.status(authResult.status).json({ error: authResult.error });
+    }
+    const user = authResult.user;
+
+    const { entryId } = req.body || {};
+    if (!entryId || typeof entryId !== 'string') {
+      return res.status(400).json({ error: 'entryId is required and must be a string' });
+    }
+
+    try {
+      const entryRef = db.collection(FINANCIAL_ENTRIES_COLLECTION).doc(entryId);
+      const entrySnap = await entryRef.get();
+
+      if (!entrySnap.exists) {
+        return res.status(404).json({ error: 'Entry not found' });
+      }
+
+      await entryRef.update({
+        isDeleted: true,
+        deletedBy: user.uid,
+        deletedAt: serverTimestamp(),
+            updatedAt: serverTimestamp()
+          });
+
+      console.log(`Financial entry soft deleted: ${entryId}`);
+
+      return res.status(200).json({
+        success: true,
+        message: 'Η εγγραφή διαγράφηκε επιτυχώς',
+        entryId
+      });
+
+    } catch (error) {
+      console.error('Failed to delete financial entry:', error);
+      return res.status(500).json({
+        error: 'Failed to delete entry',
+        details: error.message
+      });
+    }
+  });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GET FINANCIAL REPORT
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Retrieves financial entries and summary for a date range.
+//
+// Request Body:
+// {
+//   startDate: string,             // ISO date string
+//   endDate: string,               // ISO date string
+//   type?: "income" | "expense",   // Optional filter
+//   includeDeleted?: boolean       // Default false
+// }
+// ═══════════════════════════════════════════════════════════════════════════════
+
+exports.getFinancialReport = functions
+  .region(REGION)
+  .runWith(FUNCTION_OPTIONS)
+  .https.onRequest(async (req, res) => {
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
+    if (req.method === 'OPTIONS') {
+      return res.status(204).send('');
+    }
+
+    if (req.method !== 'POST') {
+      return res.status(405).json({ error: 'Method not allowed. Use POST.' });
+    }
+
+    const authResult = await authenticateRequest(req);
+    if (authResult.error) {
+      return res.status(authResult.status).json({ error: authResult.error });
+    }
+
+    const { startDate, endDate, type, includeDeleted } = req.body || {};
+
+    if (!startDate || !endDate) {
+      return res.status(400).json({ error: 'startDate and endDate are required' });
+    }
+
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+    end.setHours(23, 59, 59, 999); // Include entire end day
+
+    if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+      return res.status(400).json({ error: 'Invalid date format' });
+    }
+
+    try {
+      let query = db.collection(FINANCIAL_ENTRIES_COLLECTION)
+        .where('date', '>=', admin.firestore.Timestamp.fromDate(start))
+        .where('date', '<=', admin.firestore.Timestamp.fromDate(end));
+
+      if (type && Object.values(ENTRY_TYPE).includes(type)) {
+        query = query.where('type', '==', type);
+      }
+
+      const snapshot = await query.orderBy('date', 'desc').get();
+
+      const entries = [];
+      let totalIncome = 0;
+      let totalExpenses = 0;
+      const incomeBreakdown = {};
+      const expenseBreakdown = {};
+
+      snapshot.forEach(doc => {
+        const data = doc.data();
+        
+        // Skip deleted unless requested
+        if (data.isDeleted && !includeDeleted) {
+          return;
+        }
+
+        const entry = {
+          id: doc.id,
+          ...data,
+          date: data.date?.toDate?.()?.toISOString() || data.date
+        };
+        entries.push(entry);
+
+        // Calculate totals (only non-deleted)
+        if (!data.isDeleted) {
+          if (data.type === ENTRY_TYPE.income) {
+            totalIncome += data.amount;
+            incomeBreakdown[data.category] = (incomeBreakdown[data.category] || 0) + data.amount;
+          } else if (data.type === ENTRY_TYPE.expense) {
+            totalExpenses += data.amount;
+            expenseBreakdown[data.category] = (expenseBreakdown[data.category] || 0) + data.amount;
+          }
+        }
+      });
+
+      return res.status(200).json({
+        success: true,
+        data: {
+          period: { startDate, endDate },
+          summary: {
+            totalIncome: Math.round(totalIncome * 100) / 100,
+            totalExpenses: Math.round(totalExpenses * 100) / 100,
+            netBalance: Math.round((totalIncome - totalExpenses) * 100) / 100,
+            entryCount: entries.length
+          },
+          breakdown: {
+            income: incomeBreakdown,
+            expenses: expenseBreakdown
+          },
+          entries
+        }
+      });
+
+    } catch (error) {
+      console.error('Failed to get financial report:', error);
+      return res.status(500).json({
+        error: 'Failed to get report',
+        details: error.message
+      });
+    }
+  });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RECURRING EXPENSES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Validates recurring expense request
+ */
+function validateRecurringExpenseRequest(body) {
+  const errors = [];
+
+  if (!body.category || !VALID_EXPENSE_CATEGORIES.includes(body.category)) {
+    errors.push(`category must be one of: ${VALID_EXPENSE_CATEGORIES.join(', ')}`);
+  }
+
+  if (typeof body.amount !== 'number' || body.amount <= 0) {
+    errors.push('amount is required and must be a positive number');
+  }
+
+  if (!body.dayOfMonth || typeof body.dayOfMonth !== 'number' || body.dayOfMonth < 1 || body.dayOfMonth > 28) {
+    errors.push('dayOfMonth is required and must be between 1 and 28');
+  }
+
+  if (body.description !== undefined && typeof body.description !== 'string') {
+    errors.push('description must be a string');
+  }
+
+  return errors;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ADD RECURRING EXPENSE
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Sets up a recurring monthly expense (e.g., rent, utilities).
+//
+// Request Body:
+// {
+//   category: string,              // Expense category
+//   amount: number,
+//   dayOfMonth: number,            // 1-28 (day to generate expense)
+//   description?: string
+// }
+// ═══════════════════════════════════════════════════════════════════════════════
+
+exports.addRecurringExpense = functions
+  .region(REGION)
+  .runWith(FUNCTION_OPTIONS)
+  .https.onRequest(async (req, res) => {
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
+    if (req.method === 'OPTIONS') {
+      return res.status(204).send('');
+    }
+
+    if (req.method !== 'POST') {
+      return res.status(405).json({ error: 'Method not allowed. Use POST.' });
+    }
+
+    const authResult = await authenticateRequest(req);
+    if (authResult.error) {
+      return res.status(authResult.status).json({ error: authResult.error });
+    }
+    const user = authResult.user;
+
+    const body = req.body || {};
+    const validationErrors = validateRecurringExpenseRequest(body);
+    if (validationErrors.length > 0) {
+      return res.status(400).json({
+        error: 'Validation failed',
+        details: validationErrors
+      });
+    }
+
+    try {
+      const recurringExpense = {
+        category: body.category,
+        amount: body.amount,
+        dayOfMonth: body.dayOfMonth,
+        description: body.description || null,
+        isActive: true,
+        createdBy: user.uid,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp()
+      };
+
+      const docRef = await db.collection(RECURRING_EXPENSES_COLLECTION).add(recurringExpense);
+
+      console.log(`Recurring expense created: ${docRef.id} - ${body.category} ${body.amount}`);
+
+      return res.status(201).json({
+        success: true,
+        message: 'Πάγιο έξοδο δημιουργήθηκε επιτυχώς',
+        data: {
+          recurringId: docRef.id,
+          ...recurringExpense
+        }
+      });
+
+    } catch (error) {
+      console.error('Failed to add recurring expense:', error);
+      return res.status(500).json({
+        error: 'Failed to add recurring expense',
+        details: error.message
+      });
+    }
+  });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// UPDATE RECURRING EXPENSE
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Updates a recurring expense.
+//
+// Request Body:
+// {
+//   recurringId: string,
+//   fields: {
+//     amount?: number,
+//     dayOfMonth?: number,
+//     description?: string,
+//     isActive?: boolean
+//   }
+// }
+// ═══════════════════════════════════════════════════════════════════════════════
+
+exports.updateRecurringExpense = functions
+  .region(REGION)
+  .runWith(FUNCTION_OPTIONS)
+  .https.onRequest(async (req, res) => {
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
+    if (req.method === 'OPTIONS') {
+      return res.status(204).send('');
+    }
+
+    if (req.method !== 'POST') {
+      return res.status(405).json({ error: 'Method not allowed. Use POST.' });
+      }
+
+    const authResult = await authenticateRequest(req);
+    if (authResult.error) {
+      return res.status(authResult.status).json({ error: authResult.error });
+    }
+    const user = authResult.user;
+
+    const { recurringId, fields } = req.body || {};
+
+    if (!recurringId || typeof recurringId !== 'string') {
+      return res.status(400).json({ error: 'recurringId is required' });
+    }
+
+    if (!fields || typeof fields !== 'object') {
+      return res.status(400).json({ error: 'fields is required and must be an object' });
+    }
+
+    // Validate fields
+    const errors = [];
+    if (fields.amount !== undefined && (typeof fields.amount !== 'number' || fields.amount <= 0)) {
+      errors.push('amount must be a positive number');
+    }
+    if (fields.dayOfMonth !== undefined && (typeof fields.dayOfMonth !== 'number' || fields.dayOfMonth < 1 || fields.dayOfMonth > 28)) {
+      errors.push('dayOfMonth must be between 1 and 28');
+    }
+    if (fields.description !== undefined && typeof fields.description !== 'string') {
+      errors.push('description must be a string');
+    }
+    if (fields.isActive !== undefined && typeof fields.isActive !== 'boolean') {
+      errors.push('isActive must be a boolean');
+    }
+
+    if (errors.length > 0) {
+      return res.status(400).json({ error: 'Validation failed', details: errors });
+    }
+
+    try {
+      const recurringRef = db.collection(RECURRING_EXPENSES_COLLECTION).doc(recurringId);
+      const recurringSnap = await recurringRef.get();
+
+      if (!recurringSnap.exists) {
+        return res.status(404).json({ error: 'Recurring expense not found' });
+      }
+
+      const updates = {
+        updatedAt: serverTimestamp(),
+        lastEditedBy: user.uid
+      };
+
+      if (fields.amount !== undefined) updates.amount = fields.amount;
+      if (fields.dayOfMonth !== undefined) updates.dayOfMonth = fields.dayOfMonth;
+      if (fields.description !== undefined) updates.description = fields.description;
+      if (fields.isActive !== undefined) updates.isActive = fields.isActive;
+
+      await recurringRef.update(updates);
+
+      console.log(`Recurring expense updated: ${recurringId}`);
+
+      return res.status(200).json({
+        success: true,
+        message: 'Πάγιο έξοδο ενημερώθηκε επιτυχώς',
+        recurringId
+      });
+
+    } catch (error) {
+      console.error('Failed to update recurring expense:', error);
+      return res.status(500).json({
+        error: 'Failed to update recurring expense',
+        details: error.message
+      });
+    }
+  });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PROCESS RECURRING EXPENSES (Scheduled)
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Runs daily to generate expense entries for recurring expenses.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+exports.processRecurringExpenses = functions
+  .region(REGION)
+  .runWith(FUNCTION_OPTIONS)
+  .pubsub.schedule('0 6 * * *')  // Run at 6:00 AM daily
+  .timeZone('Europe/Athens')
+  .onRun(async () => {
+    const today = new Date();
+    const dayOfMonth = today.getDate();
+
+    console.log(`Processing recurring expenses for day ${dayOfMonth}`);
+
+    try {
+      // Find all active recurring expenses for today's day of month
+      const snapshot = await db.collection(RECURRING_EXPENSES_COLLECTION)
+        .where('isActive', '==', true)
+        .where('dayOfMonth', '==', dayOfMonth)
+        .get();
+
+      if (snapshot.empty) {
+        console.log('No recurring expenses to process today');
+        return null;
+      }
+
+      const batch = db.batch();
+      let count = 0;
+
+      snapshot.forEach(doc => {
+        const recurring = doc.data();
+        
+        const entry = {
+          type: ENTRY_TYPE.expense,
+          category: recurring.category,
+          amount: recurring.amount,
+          date: admin.firestore.Timestamp.fromDate(today),
+          description: recurring.description || `Πάγιο έξοδο: ${recurring.category}`,
+          source: ENTRY_SOURCE.recurring,
+          metadata: {
+            recurringExpenseId: doc.id
+          },
+          isDeleted: false,
+          createdBy: recurring.createdBy,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp()
+        };
+
+        const newEntryRef = db.collection(FINANCIAL_ENTRIES_COLLECTION).doc();
+        batch.set(newEntryRef, entry);
+        count++;
+      });
+
+        await batch.commit();
+
+      console.log(`Created ${count} recurring expense entries for day ${dayOfMonth}`);
+      return null;
+
+    } catch (error) {
+      console.error('Failed to process recurring expenses:', error);
+      throw error;
+    }
+  });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GET RECURRING EXPENSES
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Lists all recurring expenses.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+exports.getRecurringExpenses = functions
+  .region(REGION)
+  .runWith(FUNCTION_OPTIONS)
+  .https.onRequest(async (req, res) => {
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
+    if (req.method === 'OPTIONS') {
+      return res.status(204).send('');
+      }
+
+    if (req.method !== 'GET') {
+      return res.status(405).json({ error: 'Method not allowed. Use GET.' });
+    }
+
+    const authResult = await authenticateRequest(req);
+    if (authResult.error) {
+      return res.status(authResult.status).json({ error: authResult.error });
+    }
+
+    try {
+      const snapshot = await db.collection(RECURRING_EXPENSES_COLLECTION)
+        .orderBy('createdAt', 'desc')
+        .get();
+
+      const expenses = [];
+      snapshot.forEach(doc => {
+        expenses.push({
+          id: doc.id,
+          ...doc.data()
+        });
+      });
+
+      return res.status(200).json({
+        success: true,
+        data: expenses
+      });
+
+    } catch (error) {
+      console.error('Failed to get recurring expenses:', error);
+      return res.status(500).json({
+        error: 'Failed to get recurring expenses',
         details: error.message
       });
     }
