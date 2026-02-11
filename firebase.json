@@ -1,7 +1,7 @@
 {
   "functions": {
     "source": "functions",
-    "defaultRegion": "europe-west8"
+    "runtime": "nodejs20"
   },
   "emulators": {
     "auth": {
@@ -24,7 +24,7 @@
   },
   "firestore": {
     "database": "(default)",
-    "location": "europe-west8",
+    "location": "europe-west6",
     "rules": "firestore.rules",
     "indexes": "firestore.indexes.json"
   }

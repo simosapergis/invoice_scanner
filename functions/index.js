@@ -12,7 +12,7 @@ const { PDFDocument } = require('pdf-lib');
 const OpenAI = require('openai');
 const crypto = require('crypto');
 
-const app = admin.initializeApp();
+admin.initializeApp();
 
 const storage = new Storage();
 const visionClient = new vision.ImageAnnotatorClient();
@@ -490,12 +490,10 @@ function parseUploadObjectName(objectName) {
   if (!pageMatch) return null;
 
   const pageNumber = Number(pageMatch[1]);
-  const originalFilename = rest.slice(pageMatch[0].length);
 
   return {
     invoiceId,
-    pageNumber,
-    originalFilename
+    pageNumber
   };
 }
 
@@ -903,7 +901,8 @@ exports.getSignedUploadUrl_v2 = onRequest(
       });
     } catch (error) {
       console.error('Failed to create signed URL:', error);
-      return res.status(400).json({ error: error.message });
+      const status = error.httpStatus || 500;
+      return res.status(status).json({ error: error.message });
     }
   }
 );
@@ -1566,7 +1565,8 @@ const EDITABLE_INVOICE_FIELDS = [
   'netAmount',
   'vatAmount',
   'vatRate',
-  'paidAmount'
+  'paidAmount',
+  'currency'
 ];
 
 /**
@@ -2783,7 +2783,7 @@ exports.processRecurringExpenses_v2 = onSchedule(
 
     } catch (error) {
       console.error('Failed to process recurring expenses:', error);
-      throw error;
+      return null;
     }
   }
 );

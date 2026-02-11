@@ -23,7 +23,7 @@ export FIREBASE_API_KEY=your-firebase-web-api-key
 export FIREBASE_AUTH_EMAIL=your-user@example.com
 export FIREBASE_AUTH_PASSWORD=super-secret
 export FIREBASE_PROJECT_ID=level-approach-479119-b3          # or set SIGNED_URL_ENDPOINT directly
-export FIREBASE_FUNCTION_REGION=europe-west8                 # default is us-central1
+export FIREBASE_FUNCTION_REGION=europe-west6                 # default is us-central1
 # Start a new invoice (page 1 of 3)
 npm run upload:invoice -- ./invoice-page1.jpg --page 1 --total-pages 3 --content-type image/jpeg
 # Reuse the invoiceId returned above for the remaining pages
@@ -99,7 +99,7 @@ $env:FIREBASE_API_KEY = "your-firebase-web-api-key"
 $env:FIREBASE_AUTH_EMAIL = "your-user@example.com"
 $env:FIREBASE_AUTH_PASSWORD = "super-secret"
 $env:FIREBASE_PROJECT_ID = "level-approach-479119-b3"   # or set SIGNED_URL_ENDPOINT
-#$env:FIREBASE_FUNCTION_REGION = "europe-west8"
+#$env:FIREBASE_FUNCTION_REGION = "europe-west6"
 # Page 1 of a 2-page invoice
 npm run upload:invoice -- .\invoice-page1.jpg --page 1 --total-pages 2 --content-type image/jpeg
 # Subsequent pages reuse the invoiceId returned earlier
@@ -136,7 +136,7 @@ firebase functions:config:get > functions.config.json
 
 # 0. Create bucket
 gcloud storage buckets create gs://${PROJECT_NAME} \
-  --location=europe-west8 \
+  --location=europe-west6 \
   --uniform-bucket-level-access
 
 # 1. Point to prod in .firebaserc
@@ -151,7 +151,7 @@ firebase deploy --only firestore:rules,firestore:indexes
 # 4. Set functions config (v1)
 firebase functions:config:set uploads.bucket="level-approach-479119-b3.firebasestorage.app"
 firebase functions:config:set serviceAccount.email="mylogia@level-approach-479119-b3.iam.gserviceaccount.com"
-firebase functions:config:set region.name="europe-west8"
+firebase functions:config:set region.name="europe-west6"
 firebase functions:config:set openai.key="<..>"
 
 # 5. Deploy functions
