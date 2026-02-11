@@ -1,4 +1,10 @@
-const functions = require('firebase-functions');
+// Firebase Functions v2 imports
+const { onRequest } = require('firebase-functions/v2/https');
+const { onObjectFinalized } = require('firebase-functions/v2/storage');
+const { onDocumentWritten } = require('firebase-functions/v2/firestore');
+const { onSchedule } = require('firebase-functions/v2/scheduler');
+const { defineString } = require('firebase-functions/params');
+
 const admin = require('firebase-admin');
 const { Storage } = require('@google-cloud/storage');
 const vision = require('@google-cloud/vision');
@@ -11,18 +17,15 @@ const app = admin.initializeApp();
 const storage = new Storage();
 const visionClient = new vision.ImageAnnotatorClient();
 const db = admin.firestore();
+
+// Define environment parameters (type-safe, validated at deploy time)
+const SERVICE_ACCOUNT_EMAIL = defineString('SERVICE_ACCOUNT_EMAIL');
+const REGION = defineString('REGION', { default: 'europe-west6' });
+const OPENAI_API_KEY = defineString('OPENAI_API_KEY');
+const GCS_BUCKET = defineString('GCS_BUCKET');
+
 const UPLOADS_PREFIX = 'uploads/';
 const METADATA_INVOICE_COLLECTION = 'metadata_invoices';
-const SERVICE_ACCOUNT_EMAIL = process.env.SERVICE_ACCOUNT_EMAIL || undefined;
-const REGION = process.env.REGION || 'europe-west6';
-
-console.log('env SERVICE_ACCOUNT_EMAIL', SERVICE_ACCOUNT_EMAIL);
-console.log('env REGION', REGION);
-
-// Build runWith options - only include serviceAccount if defined
-const FUNCTION_OPTIONS = SERVICE_ACCOUNT_EMAIL 
-  ? { serviceAccount: SERVICE_ACCOUNT_EMAIL }
-  : {};
 
 const SIGNED_URL_TTL_MS = 15 * 60 * 1000;
 const INVOICE_STATUS = {
@@ -127,8 +130,15 @@ function formatMetadataSuccess(invoiceNumber, supplierName) {
       .replace('%s', supplierName);
 }
 
-const openAiApiKey = process.env.OPENAI_API_KEY;
-const openaiClient = openAiApiKey ? new OpenAI({ apiKey: openAiApiKey }) : null;
+// Initialize OpenAI client - params are evaluated lazily
+let openaiClient = null;
+function getOpenAIClient() {
+  if (!openaiClient) {
+    const apiKey = OPENAI_API_KEY.value();
+    openaiClient = apiKey ? new OpenAI({ apiKey }) : null;
+  }
+  return openaiClient;
+}
 const OCR_MAX_RETRIES = 3;
 
 
@@ -294,7 +304,7 @@ function parseJsonFromResponse(text) {
 }
 
 function getBucketName() {
-  return process.env.GCS_BUCKET;
+  return GCS_BUCKET.value();
 }
 
 function invoiceDocRef(invoiceId) {
@@ -562,7 +572,8 @@ async function buildCombinedPdfFromPages(pageEntries, defaultBucket) {
 }
 
 async function runInvoiceOcr(pageBuffers) {
-  if (!openaiClient) {
+  const client = getOpenAIClient();
+  if (!client) {
     console.warn('OPENAI_API_KEY not configured; skipping OCR.');
     return null;
   }
@@ -594,6 +605,7 @@ async function runInvoiceOcr(pageBuffers) {
 }
 
 async function runInvoiceOcrAttempt(pageBuffers) {
+  const client = getOpenAIClient();
   const aggregatedText = [];
   for (const page of pageBuffers) {
     const mimeType = page.mimeType || 'application/octet-stream';
@@ -759,7 +771,7 @@ async function runInvoiceOcrAttempt(pageBuffers) {
     fullText;
     
 
-  const response = await openaiClient.responses.create({
+  const response = await client.responses.create({
     model: 'gpt-4o-mini',
     input: [
       {
@@ -802,147 +814,159 @@ async function runInvoiceOcrAttempt(pageBuffers) {
   return parseJsonFromResponse(rawText);
 }
 
-//exports.getSignedUploadUrl = functions.region('europe-west8').https.onRequest(async (req, res) => {
-exports.getSignedUploadUrl = functions
-  .region(REGION)
-  .runWith(FUNCTION_OPTIONS)
-  .https.onRequest(async (req, res) => {
-  res.set('Access-Control-Allow-Origin', '*');
-  res.set('Access-Control-Allow-Headers', 'Authorization, Content-Type');
-  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
-
-  if (req.method === 'OPTIONS') {
-    return res.status(204).send('');
-  }
-
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' });
-  }
-
-  const bucketName = getBucketName();
-  if (!bucketName) {
-    return res.status(500).json({ error: 'Missing GCS bucket configuration' });
-  }
-
-  const idToken = extractBearerToken(req.header('Authorization'));
-  if (!idToken) {
-    return res.status(401).json({ error: 'Missing Authorization: Bearer <token>' });
-  }
-
-  let decoded;
-  try {
-    decoded = await admin.auth().verifyIdToken(idToken);
-  } catch (error) {
-    return res.status(401).json({
-      error: 'Invalid or expired Firebase ID token',
-      details: error.message
-    });
-  }
-
-  const {
-    filename,
-    contentType = 'application/octet-stream',
-    invoiceId,
-    pageNumber,
-    totalPages = null
-  } = req.body || {};
-
-  if (!filename) {
-    return res.status(400).json({ error: 'filename is required in the request body' });
-  }
-
-  try {
-    const normalizedTotalPages = normalizeTotalPages(totalPages);
-    const normalizedPageNumber = normalizePageNumber(pageNumber);
-    const sanitizedFilename = sanitizeFilename(filename);
-    const invoiceMetadata = await ensureInvoiceDocument({
-      invoiceId,
-      uid: decoded.uid,
-      bucketName,
-      totalPages: normalizedTotalPages
-    });
-    const resolvedInvoiceId = invoiceMetadata.invoiceId;
-    const resolvedTotalPages = invoiceMetadata.totalPages || normalizedTotalPages;
-    if (!resolvedTotalPages) {
-      throw new Error('totalPages must be specified for the invoice');
+// Blue-green deployment: v2 functions run alongside v1
+// Old function name: getSignedUploadUrl
+exports.getSignedUploadUrl_v2 = onRequest(
+  {
+    region: REGION,
+    serviceAccount: SERVICE_ACCOUNT_EMAIL,
+    cors: true,
+    timeoutSeconds: 60,
+    memory: '256MiB'
+  },
+  async (req, res) => {
+    if (req.method !== 'POST') {
+      return res.status(405).json({ error: 'Method not allowed' });
     }
-    const objectName = `${UPLOADS_PREFIX}${resolvedInvoiceId}/page-${padPageNumber(
-      normalizedPageNumber
-    )}-${sanitizedFilename}`;
-    const expiresAtMs = Date.now() + SIGNED_URL_TTL_MS;
 
-    const [signedUrl] = await storage
-      .bucket(bucketName)
-      .file(objectName)
-      .getSignedUrl({
-        version: 'v4',
-        action: 'write',
-        expires: expiresAtMs,
-        contentType
+    const bucketName = getBucketName();
+    if (!bucketName) {
+      return res.status(500).json({ error: 'Missing GCS bucket configuration' });
+    }
+
+    const idToken = extractBearerToken(req.header('Authorization'));
+    if (!idToken) {
+      return res.status(401).json({ error: 'Missing Authorization: Bearer <token>' });
+    }
+
+    let decoded;
+    try {
+      decoded = await admin.auth().verifyIdToken(idToken);
+    } catch (error) {
+      return res.status(401).json({
+        error: 'Invalid or expired Firebase ID token',
+        details: error.message
       });
+    }
 
-    return res.json({
-      invoiceId: resolvedInvoiceId,
-      pageNumber: normalizedPageNumber,
-      totalPages: resolvedTotalPages,
-      uploadUrl: signedUrl,
-      bucket: bucketName,
-      objectName,
-      contentType,
-      expiresAt: new Date(expiresAtMs).toISOString()
-    });
-  } catch (error) {
-    console.error('Failed to create signed URL:', error);
-    return res.status(400).json({ error: error.message });
+    const {
+      filename,
+      contentType = 'application/octet-stream',
+      invoiceId,
+      pageNumber,
+      totalPages = null
+    } = req.body || {};
+
+    if (!filename) {
+      return res.status(400).json({ error: 'filename is required in the request body' });
+    }
+
+    try {
+      const normalizedTotalPages = normalizeTotalPages(totalPages);
+      const normalizedPageNumber = normalizePageNumber(pageNumber);
+      const sanitizedFilename = sanitizeFilename(filename);
+      const invoiceMetadata = await ensureInvoiceDocument({
+        invoiceId,
+        uid: decoded.uid,
+        bucketName,
+        totalPages: normalizedTotalPages
+      });
+      const resolvedInvoiceId = invoiceMetadata.invoiceId;
+      const resolvedTotalPages = invoiceMetadata.totalPages || normalizedTotalPages;
+      if (!resolvedTotalPages) {
+        throw new Error('totalPages must be specified for the invoice');
+      }
+      const objectName = `${UPLOADS_PREFIX}${resolvedInvoiceId}/page-${padPageNumber(
+        normalizedPageNumber
+      )}-${sanitizedFilename}`;
+      const expiresAtMs = Date.now() + SIGNED_URL_TTL_MS;
+
+      const [signedUrl] = await storage
+        .bucket(bucketName)
+        .file(objectName)
+        .getSignedUrl({
+          version: 'v4',
+          action: 'write',
+          expires: expiresAtMs,
+          contentType
+        });
+
+      return res.json({
+        invoiceId: resolvedInvoiceId,
+        pageNumber: normalizedPageNumber,
+        totalPages: resolvedTotalPages,
+        uploadUrl: signedUrl,
+        bucket: bucketName,
+        objectName,
+        contentType,
+        expiresAt: new Date(expiresAtMs).toISOString()
+      });
+    } catch (error) {
+      console.error('Failed to create signed URL:', error);
+      return res.status(400).json({ error: error.message });
+    }
   }
-});
+);
 
-exports.processUploadedInvoice = functions
-  .region(REGION)
-  .runWith(FUNCTION_OPTIONS)
-  .storage.object()
-  .onFinalize(async (object) => {
-  const { name: objectName, bucket, contentType } = object;
-  if (!objectName) {
-    console.warn('Finalize event missing object name');
-    return;
+// Blue-green deployment: v2 functions run alongside v1
+// Old function name: processUploadedInvoice
+exports.processUploadedInvoice_v2 = onObjectFinalized(
+  {
+    region: REGION,
+    serviceAccount: SERVICE_ACCOUNT_EMAIL,
+    bucket: GCS_BUCKET
+  },
+  async (event) => {
+    const object = event.data;
+    const { name: objectName, bucket, contentType } = object;
+    
+    if (!objectName) {
+      console.warn('Finalize event missing object name');
+      return;
+    }
+
+    if (!objectName.startsWith(UPLOADS_PREFIX)) {
+      console.log(`Skipping ${objectName} because it is outside ${UPLOADS_PREFIX}`);
+      return;
+    }
+
+    const parsed = parseUploadObjectName(objectName);
+    if (!parsed) {
+      console.warn(`Unable to parse invoice metadata from object name: ${objectName}`);
+      return;
+    }
+
+    try {
+      await registerUploadedPage({
+        invoiceId: parsed.invoiceId,
+        pageNumber: parsed.pageNumber,
+        objectName,
+        bucketName: bucket,
+        contentType: contentType || 'application/octet-stream'
+      });
+      console.log(
+        `Registered page ${parsed.pageNumber} for invoice ${parsed.invoiceId} (${objectName})`
+      );
+    } catch (error) {
+      console.error(
+        `Failed to register page ${parsed.pageNumber} for invoice ${parsed.invoiceId}`,
+        error
+      );
+    }
   }
+);
 
-  if (!objectName.startsWith(UPLOADS_PREFIX)) {
-    console.log(`Skipping ${objectName} because it is outside ${UPLOADS_PREFIX}`);
-    return;
-  }
-
-  const parsed = parseUploadObjectName(objectName);
-  if (!parsed) {
-    console.warn(`Unable to parse invoice metadata from object name: ${objectName}`);
-    return;
-  }
-
-  try {
-    await registerUploadedPage({
-      invoiceId: parsed.invoiceId,
-      pageNumber: parsed.pageNumber,
-      objectName,
-      bucketName: bucket,
-      contentType: contentType || 'application/octet-stream'
-    });
-    console.log(
-      `Registered page ${parsed.pageNumber} for invoice ${parsed.invoiceId} (${objectName})`
-    );
-  } catch (error) {
-    console.error(
-      `Failed to register page ${parsed.pageNumber} for invoice ${parsed.invoiceId}`,
-      error
-    );
-  }
-});
-
-exports.processInvoiceDocument = functions
-  .region(REGION)
-  .runWith(FUNCTION_OPTIONS)
-  .firestore.document(`${METADATA_INVOICE_COLLECTION}/{invoiceId}`)
-  .onWrite(async (change, context) => {
+// Blue-green deployment: v2 functions run alongside v1
+// Old function name: processInvoiceDocument
+exports.processInvoiceDocument_v2 = onDocumentWritten(
+  {
+    region: REGION,
+    serviceAccount: SERVICE_ACCOUNT_EMAIL,
+    document: `${METADATA_INVOICE_COLLECTION}/{invoiceId}`
+  },
+  async (event) => {
+    const change = event.data;
+    const context = event.params;
     const after = change.after.exists ? change.after.data() : null;
     if (!after) {
       return;
@@ -957,6 +981,7 @@ exports.processInvoiceDocument = functions
       return;
     }
 
+    const openaiClient = getOpenAIClient();
     if (!openaiClient) {
       console.warn('OPENAI_API_KEY not configured; unable to run OCR.');
       await change.after.ref.update({
@@ -994,7 +1019,7 @@ exports.processInvoiceDocument = functions
       return;
     }
 
-    const invoiceId = context.params.invoiceId;
+    const invoiceId = context.invoiceId;
     const invoiceData = lockedSnapshot;
     const bucketName = invoiceData.bucket || getBucketName();
     if (!bucketName) {
@@ -1206,7 +1231,8 @@ exports.processInvoiceDocument = functions
 
       // TODO: send notification on error
     }
-  });
+  }
+);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // PAYMENT STATUS UPDATE FUNCTION
@@ -1311,19 +1337,17 @@ function derivePaymentStatus(paidAmount, totalAmount) {
   return PAYMENT_STATUS.unpaid;
 }
 
-exports.updatePaymentStatus = functions
-  .region(REGION)
-  .runWith(FUNCTION_OPTIONS)
-  .https.onRequest(async (req, res) => {
-    // CORS headers
-    res.set('Access-Control-Allow-Origin', '*');
-    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-
-    if (req.method === 'OPTIONS') {
-      return res.status(204).send('');
-    }
-
+// Blue-green deployment: v2 functions run alongside v1
+// Old function name: updatePaymentStatus
+exports.updatePaymentStatus_v2 = onRequest(
+  {
+    region: REGION,
+    serviceAccount: SERVICE_ACCOUNT_EMAIL,
+    cors: true,
+    timeoutSeconds: 60,
+    memory: '256MiB'
+  },
+  async (req, res) => {
     if (req.method !== 'POST') {
       return res.status(405).json({ error: 'Method not allowed. Use POST.' });
     }
@@ -1498,7 +1522,8 @@ exports.updatePaymentStatus = functions
         code: httpStatus === 500 ? 'INTERNAL_ERROR' : 'PAYMENT_ERROR'
       });
     }
-  });
+  }
+);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // UPDATE INVOICE FIELDS
@@ -1619,19 +1644,17 @@ function validateUpdateFieldsRequest(body) {
   return errors;
 }
 
-exports.updateInvoiceFields = functions
-  .region(REGION)
-  .runWith(FUNCTION_OPTIONS)
-  .https.onRequest(async (req, res) => {
-    // CORS headers
-    res.set('Access-Control-Allow-Origin', '*');
-    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-
-    if (req.method === 'OPTIONS') {
-      return res.status(204).send('');
-    }
-
+// Blue-green deployment: v2 functions run alongside v1
+// Old function name: updateInvoiceFields
+exports.updateInvoiceFields_v2 = onRequest(
+  {
+    region: REGION,
+    serviceAccount: SERVICE_ACCOUNT_EMAIL,
+    cors: true,
+    timeoutSeconds: 60,
+    memory: '256MiB'
+  },
+  async (req, res) => {
     if (req.method !== 'POST') {
       return res.status(405).json({ error: 'Method not allowed. Use POST.' });
     }
@@ -1791,7 +1814,8 @@ exports.updateInvoiceFields = functions
         code: httpStatus === 500 ? 'INTERNAL_ERROR' : 'UPDATE_ERROR'
       });
     }
-  });
+  }
+);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // UPDATE SUPPLIER FIELDS
@@ -1918,19 +1942,17 @@ function validateUpdateSupplierRequest(body) {
   return errors;
 }
 
-exports.updateSupplierFields = functions
-  .region(REGION)
-  .runWith(FUNCTION_OPTIONS)
-  .https.onRequest(async (req, res) => {
-    // CORS headers
-    res.set('Access-Control-Allow-Origin', '*');
-    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-
-    if (req.method === 'OPTIONS') {
-      return res.status(204).send('');
-    }
-
+// Blue-green deployment: v2 functions run alongside v1
+// Old function name: updateSupplierFields
+exports.updateSupplierFields_v2 = onRequest(
+  {
+    region: REGION,
+    serviceAccount: SERVICE_ACCOUNT_EMAIL,
+    cors: true,
+    timeoutSeconds: 60,
+    memory: '256MiB'
+  },
+  async (req, res) => {
     if (req.method !== 'POST') {
       return res.status(405).json({ error: 'Method not allowed. Use POST.' });
     }
@@ -2034,7 +2056,8 @@ exports.updateSupplierFields = functions
         code: httpStatus === 500 ? 'INTERNAL_ERROR' : 'UPDATE_ERROR'
       });
     }
-  });
+  }
+);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SIGNED DOWNLOAD URL
@@ -2057,19 +2080,17 @@ exports.updateSupplierFields = functions
 // - Requires Firebase Authentication (any authenticated user can download)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-exports.getSignedDownloadUrl = functions
-  .region(REGION)
-  .runWith(FUNCTION_OPTIONS)
-  .https.onRequest(async (req, res) => {
-    // CORS headers
-    res.set('Access-Control-Allow-Origin', '*');
-    res.set('Access-Control-Allow-Headers', 'Authorization, Content-Type');
-    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
-
-    if (req.method === 'OPTIONS') {
-      return res.status(204).send('');
-    }
-
+// Blue-green deployment: v2 functions run alongside v1
+// Old function name: getSignedDownloadUrl
+exports.getSignedDownloadUrl_v2 = onRequest(
+  {
+    region: REGION,
+    serviceAccount: SERVICE_ACCOUNT_EMAIL,
+    cors: true,
+    timeoutSeconds: 60,
+    memory: '256MiB'
+  },
+  async (req, res) => {
     if (req.method !== 'POST') {
       return res.status(405).json({ error: 'Method not allowed. Use POST.' });
     }
@@ -2133,7 +2154,8 @@ exports.getSignedDownloadUrl = functions
         details: error.message
       });
     }
-  });
+  }
+);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // FINANCIAL TRACKING FUNCTIONS
@@ -2219,18 +2241,17 @@ function buildFinancialEntry({ type, category, amount, date, description, source
 // }
 // ═══════════════════════════════════════════════════════════════════════════════
 
-exports.addFinancialEntry = functions
-  .region(REGION)
-  .runWith(FUNCTION_OPTIONS)
-  .https.onRequest(async (req, res) => {
-    res.set('Access-Control-Allow-Origin', '*');
-    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-
-    if (req.method === 'OPTIONS') {
-      return res.status(204).send('');
-    }
-
+// Blue-green deployment: v2 functions run alongside v1
+// Old function name: addFinancialEntry
+exports.addFinancialEntry_v2 = onRequest(
+  {
+    region: REGION,
+    serviceAccount: SERVICE_ACCOUNT_EMAIL,
+    cors: true,
+    timeoutSeconds: 60,
+    memory: '256MiB'
+  },
+  async (req, res) => {
     if (req.method !== 'POST') {
       return res.status(405).json({ error: 'Method not allowed. Use POST.' });
     }
@@ -2284,7 +2305,8 @@ exports.addFinancialEntry = functions
         details: error.message
       });
     }
-  });
+  }
+);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // DELETE FINANCIAL ENTRY (Soft Delete)
@@ -2298,18 +2320,17 @@ exports.addFinancialEntry = functions
 // }
 // ═══════════════════════════════════════════════════════════════════════════════
 
-exports.deleteFinancialEntry = functions
-  .region(REGION)
-  .runWith(FUNCTION_OPTIONS)
-  .https.onRequest(async (req, res) => {
-    res.set('Access-Control-Allow-Origin', '*');
-    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-
-    if (req.method === 'OPTIONS') {
-      return res.status(204).send('');
-    }
-
+// Blue-green deployment: v2 functions run alongside v1
+// Old function name: deleteFinancialEntry
+exports.deleteFinancialEntry_v2 = onRequest(
+  {
+    region: REGION,
+    serviceAccount: SERVICE_ACCOUNT_EMAIL,
+    cors: true,
+    timeoutSeconds: 60,
+    memory: '256MiB'
+  },
+  async (req, res) => {
     if (req.method !== 'POST') {
       return res.status(405).json({ error: 'Method not allowed. Use POST.' });
     }
@@ -2355,7 +2376,8 @@ exports.deleteFinancialEntry = functions
         details: error.message
       });
     }
-  });
+  }
+);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // GET FINANCIAL REPORT
@@ -2372,18 +2394,17 @@ exports.deleteFinancialEntry = functions
 // }
 // ═══════════════════════════════════════════════════════════════════════════════
 
-exports.getFinancialReport = functions
-  .region(REGION)
-  .runWith(FUNCTION_OPTIONS)
-  .https.onRequest(async (req, res) => {
-    res.set('Access-Control-Allow-Origin', '*');
-    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-
-    if (req.method === 'OPTIONS') {
-      return res.status(204).send('');
-    }
-
+// Blue-green deployment: v2 functions run alongside v1
+// Old function name: getFinancialReport
+exports.getFinancialReport_v2 = onRequest(
+  {
+    region: REGION,
+    serviceAccount: SERVICE_ACCOUNT_EMAIL,
+    cors: true,
+    timeoutSeconds: 60,
+    memory: '256MiB'
+  },
+  async (req, res) => {
     if (req.method !== 'POST') {
       return res.status(405).json({ error: 'Method not allowed. Use POST.' });
     }
@@ -2476,7 +2497,8 @@ exports.getFinancialReport = functions
         details: error.message
       });
     }
-  });
+  }
+);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // RECURRING EXPENSES
@@ -2522,18 +2544,17 @@ function validateRecurringExpenseRequest(body) {
 // }
 // ═══════════════════════════════════════════════════════════════════════════════
 
-exports.addRecurringExpense = functions
-  .region(REGION)
-  .runWith(FUNCTION_OPTIONS)
-  .https.onRequest(async (req, res) => {
-    res.set('Access-Control-Allow-Origin', '*');
-    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-
-    if (req.method === 'OPTIONS') {
-      return res.status(204).send('');
-    }
-
+// Blue-green deployment: v2 functions run alongside v1
+// Old function name: addRecurringExpense
+exports.addRecurringExpense_v2 = onRequest(
+  {
+    region: REGION,
+    serviceAccount: SERVICE_ACCOUNT_EMAIL,
+    cors: true,
+    timeoutSeconds: 60,
+    memory: '256MiB'
+  },
+  async (req, res) => {
     if (req.method !== 'POST') {
       return res.status(405).json({ error: 'Method not allowed. Use POST.' });
     }
@@ -2585,7 +2606,8 @@ exports.addRecurringExpense = functions
         details: error.message
       });
     }
-  });
+  }
+);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // UPDATE RECURRING EXPENSE
@@ -2605,21 +2627,20 @@ exports.addRecurringExpense = functions
 // }
 // ═══════════════════════════════════════════════════════════════════════════════
 
-exports.updateRecurringExpense = functions
-  .region(REGION)
-  .runWith(FUNCTION_OPTIONS)
-  .https.onRequest(async (req, res) => {
-    res.set('Access-Control-Allow-Origin', '*');
-    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-
-    if (req.method === 'OPTIONS') {
-      return res.status(204).send('');
-    }
-
+// Blue-green deployment: v2 functions run alongside v1
+// Old function name: updateRecurringExpense
+exports.updateRecurringExpense_v2 = onRequest(
+  {
+    region: REGION,
+    serviceAccount: SERVICE_ACCOUNT_EMAIL,
+    cors: true,
+    timeoutSeconds: 60,
+    memory: '256MiB'
+  },
+  async (req, res) => {
     if (req.method !== 'POST') {
       return res.status(405).json({ error: 'Method not allowed. Use POST.' });
-      }
+    }
 
     const authResult = await authenticateRequest(req);
     if (authResult.error) {
@@ -2691,7 +2712,8 @@ exports.updateRecurringExpense = functions
         details: error.message
       });
     }
-  });
+  }
+);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // PROCESS RECURRING EXPENSES (Scheduled)
@@ -2700,12 +2722,16 @@ exports.updateRecurringExpense = functions
 // Runs daily to generate expense entries for recurring expenses.
 // ═══════════════════════════════════════════════════════════════════════════════
 
-exports.processRecurringExpenses = functions
-  .region(REGION)
-  .runWith(FUNCTION_OPTIONS)
-  .pubsub.schedule('0 6 * * *')  // Run at 6:00 AM daily
-  .timeZone('Europe/Athens')
-  .onRun(async () => {
+// Blue-green deployment: v2 functions run alongside v1
+// Old function name: processRecurringExpenses
+exports.processRecurringExpenses_v2 = onSchedule(
+  {
+    region: REGION,
+    serviceAccount: SERVICE_ACCOUNT_EMAIL,
+    schedule: '0 6 * * *',  // Run at 6:00 AM daily
+    timeZone: 'Europe/Athens'
+  },
+  async (event) => {
     const today = new Date();
     const dayOfMonth = today.getDate();
 
@@ -2759,7 +2785,8 @@ exports.processRecurringExpenses = functions
       console.error('Failed to process recurring expenses:', error);
       throw error;
     }
-  });
+  }
+);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // GET RECURRING EXPENSES
@@ -2768,18 +2795,17 @@ exports.processRecurringExpenses = functions
 // Lists all recurring expenses.
 // ═══════════════════════════════════════════════════════════════════════════════
 
-exports.getRecurringExpenses = functions
-  .region(REGION)
-  .runWith(FUNCTION_OPTIONS)
-  .https.onRequest(async (req, res) => {
-    res.set('Access-Control-Allow-Origin', '*');
-    res.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
-    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-
-    if (req.method === 'OPTIONS') {
-      return res.status(204).send('');
-      }
-
+// Blue-green deployment: v2 functions run alongside v1
+// Old function name: getRecurringExpenses
+exports.getRecurringExpenses_v2 = onRequest(
+  {
+    region: REGION,
+    serviceAccount: SERVICE_ACCOUNT_EMAIL,
+    cors: true,
+    timeoutSeconds: 60,
+    memory: '256MiB'
+  },
+  async (req, res) => {
     if (req.method !== 'GET') {
       return res.status(405).json({ error: 'Method not allowed. Use GET.' });
     }
@@ -2814,4 +2840,5 @@ exports.getRecurringExpenses = functions
         details: error.message
       });
     }
-  });
+  }
+);
