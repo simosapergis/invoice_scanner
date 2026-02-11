@@ -42,6 +42,14 @@ const PAYMENT_STATUS = {
   partiallyPaid: 'partially_paid'
 };
 
+const HTTP_OPTS = {
+  region: REGION,
+  serviceAccount: SERVICE_ACCOUNT_EMAIL,
+  cors: true,
+  timeoutSeconds: 60,
+  memory: '256MiB',
+};
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // FINANCIAL TRACKING CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -146,6 +154,28 @@ function extractBearerToken(headerValue) {
   if (!headerValue) return null;
   const match = headerValue.match(/^Bearer\s+(.+)$/i);
   return match ? match[1] : null;
+}
+
+/**
+ * Returns false (and sends 405) if the request method doesn't match.
+ * Callers should `return` when the result is false.
+ */
+function requireMethod(req, res, method) {
+  if (req.method !== method) {
+    res.status(405).json({ error: `Method not allowed. Use ${method}.` });
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Sends a standardized JSON error response.
+ */
+function sendError(res, status, message, { details, code } = {}) {
+  const body = { error: message };
+  if (details) body.details = details;
+  if (code) body.code = code;
+  return res.status(status).json(body);
 }
 
 function sanitizeFilename(name) {
@@ -815,37 +845,20 @@ async function runInvoiceOcrAttempt(pageBuffers) {
 // Blue-green deployment: v2 functions run alongside v1
 // Old function name: getSignedUploadUrl
 exports.getSignedUploadUrl_v2 = onRequest(
-  {
-    region: REGION,
-    serviceAccount: SERVICE_ACCOUNT_EMAIL,
-    cors: true,
-    timeoutSeconds: 60,
-    memory: '256MiB'
-  },
+  HTTP_OPTS,
   async (req, res) => {
-    if (req.method !== 'POST') {
-      return res.status(405).json({ error: 'Method not allowed' });
-    }
+    if (!requireMethod(req, res, 'POST')) return;
 
     const bucketName = getBucketName();
     if (!bucketName) {
-      return res.status(500).json({ error: 'Missing GCS bucket configuration' });
+      return sendError(res, 500, 'Missing GCS bucket configuration');
     }
 
-    const idToken = extractBearerToken(req.header('Authorization'));
-    if (!idToken) {
-      return res.status(401).json({ error: 'Missing Authorization: Bearer <token>' });
+    const authResult = await authenticateRequest(req);
+    if (authResult.error) {
+      return sendError(res, authResult.status, authResult.error);
     }
-
-    let decoded;
-    try {
-      decoded = await admin.auth().verifyIdToken(idToken);
-    } catch (error) {
-      return res.status(401).json({
-        error: 'Invalid or expired Firebase ID token',
-        details: error.message
-      });
-    }
+    const decoded = authResult.user;
 
     const {
       filename,
@@ -856,7 +869,7 @@ exports.getSignedUploadUrl_v2 = onRequest(
     } = req.body || {};
 
     if (!filename) {
-      return res.status(400).json({ error: 'filename is required in the request body' });
+      return sendError(res, 400, 'filename is required in the request body');
     }
 
     try {
@@ -901,8 +914,7 @@ exports.getSignedUploadUrl_v2 = onRequest(
       });
     } catch (error) {
       console.error('Failed to create signed URL:', error);
-      const status = error.httpStatus || 500;
-      return res.status(status).json({ error: error.message });
+      return sendError(res, error.httpStatus || 500, error.message);
     }
   }
 );
@@ -1339,22 +1351,14 @@ function derivePaymentStatus(paidAmount, totalAmount) {
 // Blue-green deployment: v2 functions run alongside v1
 // Old function name: updatePaymentStatus
 exports.updatePaymentStatus_v2 = onRequest(
-  {
-    region: REGION,
-    serviceAccount: SERVICE_ACCOUNT_EMAIL,
-    cors: true,
-    timeoutSeconds: 60,
-    memory: '256MiB'
-  },
+  HTTP_OPTS,
   async (req, res) => {
-    if (req.method !== 'POST') {
-      return res.status(405).json({ error: 'Method not allowed. Use POST.' });
-    }
+    if (!requireMethod(req, res, 'POST')) return;
 
     // 1. Authenticate
     const authResult = await authenticateRequest(req);
     if (authResult.error) {
-      return res.status(authResult.status).json({ error: authResult.error });
+      return sendError(res, authResult.status, authResult.error);
     }
     const user = authResult.user;
 
@@ -1362,10 +1366,7 @@ exports.updatePaymentStatus_v2 = onRequest(
     const body = req.body || {};
     const validationErrors = validatePaymentRequest(body);
     if (validationErrors.length > 0) {
-      return res.status(400).json({ 
-        error: 'Validation failed', 
-        details: validationErrors 
-      });
+      return sendError(res, 400, 'Validation failed', { details: validationErrors });
     }
 
     const { supplierId, invoiceId, action, paymentMethod, notes } = body;
@@ -1514,12 +1515,8 @@ exports.updatePaymentStatus_v2 = onRequest(
 
     } catch (error) {
       console.error('Payment update failed:', error);
-
       const httpStatus = error.httpStatus || 500;
-      return res.status(httpStatus).json({
-        error: error.message,
-        code: httpStatus === 500 ? 'INTERNAL_ERROR' : 'PAYMENT_ERROR'
-      });
+      return sendError(res, httpStatus, error.message, { code: httpStatus === 500 ? 'INTERNAL_ERROR' : 'PAYMENT_ERROR' });
     }
   }
 );
@@ -1647,22 +1644,14 @@ function validateUpdateFieldsRequest(body) {
 // Blue-green deployment: v2 functions run alongside v1
 // Old function name: updateInvoiceFields
 exports.updateInvoiceFields_v2 = onRequest(
-  {
-    region: REGION,
-    serviceAccount: SERVICE_ACCOUNT_EMAIL,
-    cors: true,
-    timeoutSeconds: 60,
-    memory: '256MiB'
-  },
+  HTTP_OPTS,
   async (req, res) => {
-    if (req.method !== 'POST') {
-      return res.status(405).json({ error: 'Method not allowed. Use POST.' });
-    }
+    if (!requireMethod(req, res, 'POST')) return;
 
     // 1. Authenticate
     const authResult = await authenticateRequest(req);
     if (authResult.error) {
-      return res.status(authResult.status).json({ error: authResult.error });
+      return sendError(res, authResult.status, authResult.error);
     }
     const user = authResult.user;
 
@@ -1670,10 +1659,7 @@ exports.updateInvoiceFields_v2 = onRequest(
     const body = req.body || {};
     const validationErrors = validateUpdateFieldsRequest(body);
     if (validationErrors.length > 0) {
-      return res.status(400).json({
-        error: 'Validation failed',
-        details: validationErrors
-      });
+      return sendError(res, 400, 'Validation failed', { details: validationErrors });
     }
 
     const { supplierId, invoiceId, fields } = body;
@@ -1807,12 +1793,8 @@ exports.updateInvoiceFields_v2 = onRequest(
 
     } catch (error) {
       console.error('Invoice field update failed:', error);
-
       const httpStatus = error.httpStatus || 500;
-      return res.status(httpStatus).json({
-        error: error.message,
-        code: httpStatus === 500 ? 'INTERNAL_ERROR' : 'UPDATE_ERROR'
-      });
+      return sendError(res, httpStatus, error.message, { code: httpStatus === 500 ? 'INTERNAL_ERROR' : 'UPDATE_ERROR' });
     }
   }
 );
@@ -1945,22 +1927,14 @@ function validateUpdateSupplierRequest(body) {
 // Blue-green deployment: v2 functions run alongside v1
 // Old function name: updateSupplierFields
 exports.updateSupplierFields_v2 = onRequest(
-  {
-    region: REGION,
-    serviceAccount: SERVICE_ACCOUNT_EMAIL,
-    cors: true,
-    timeoutSeconds: 60,
-    memory: '256MiB'
-  },
+  HTTP_OPTS,
   async (req, res) => {
-    if (req.method !== 'POST') {
-      return res.status(405).json({ error: 'Method not allowed. Use POST.' });
-    }
+    if (!requireMethod(req, res, 'POST')) return;
 
     // 1. Authenticate
     const authResult = await authenticateRequest(req);
     if (authResult.error) {
-      return res.status(authResult.status).json({ error: authResult.error });
+      return sendError(res, authResult.status, authResult.error);
     }
     const user = authResult.user;
 
@@ -1968,10 +1942,7 @@ exports.updateSupplierFields_v2 = onRequest(
     const body = req.body || {};
     const validationErrors = validateUpdateSupplierRequest(body);
     if (validationErrors.length > 0) {
-      return res.status(400).json({
-        error: 'Validation failed',
-        details: validationErrors
-      });
+      return sendError(res, 400, 'Validation failed', { details: validationErrors });
     }
 
     const { supplierId, fields } = body;
@@ -2049,12 +2020,8 @@ exports.updateSupplierFields_v2 = onRequest(
 
     } catch (error) {
       console.error('Supplier field update failed:', error);
-
       const httpStatus = error.httpStatus || 500;
-      return res.status(httpStatus).json({
-        error: error.message,
-        code: httpStatus === 500 ? 'INTERNAL_ERROR' : 'UPDATE_ERROR'
-      });
+      return sendError(res, httpStatus, error.message, { code: httpStatus === 500 ? 'INTERNAL_ERROR' : 'UPDATE_ERROR' });
     }
   }
 );
@@ -2083,43 +2050,24 @@ exports.updateSupplierFields_v2 = onRequest(
 // Blue-green deployment: v2 functions run alongside v1
 // Old function name: getSignedDownloadUrl
 exports.getSignedDownloadUrl_v2 = onRequest(
-  {
-    region: REGION,
-    serviceAccount: SERVICE_ACCOUNT_EMAIL,
-    cors: true,
-    timeoutSeconds: 60,
-    memory: '256MiB'
-  },
+  HTTP_OPTS,
   async (req, res) => {
-    if (req.method !== 'POST') {
-      return res.status(405).json({ error: 'Method not allowed. Use POST.' });
-    }
+    if (!requireMethod(req, res, 'POST')) return;
 
-    // Authenticate
-    const idToken = extractBearerToken(req.header('Authorization'));
-    if (!idToken) {
-      return res.status(401).json({ error: 'Missing Authorization: Bearer <token>' });
-    }
-
-    let decodedToken;
-    try {
-      decodedToken = await admin.auth().verifyIdToken(idToken);
-    } catch (error) {
-      return res.status(401).json({
-        error: 'Invalid or expired Firebase ID token',
-        details: error.message
-      });
+    const authResult = await authenticateRequest(req);
+    if (authResult.error) {
+      return sendError(res, authResult.status, authResult.error);
     }
 
     const { filePath } = req.body || {};
 
     if (!filePath || typeof filePath !== 'string') {
-      return res.status(400).json({ error: 'filePath is required and must be a string' });
+      return sendError(res, 400, 'filePath is required and must be a string');
     }
 
     const bucketName = getBucketName();
     if (!bucketName) {
-      return res.status(500).json({ error: 'Missing GCS bucket configuration' });
+      return sendError(res, 500, 'Missing GCS bucket configuration');
     }
 
     try {
@@ -2128,7 +2076,7 @@ exports.getSignedDownloadUrl_v2 = onRequest(
       const [exists] = await file.exists();
 
       if (!exists) {
-        return res.status(404).json({ error: 'File not found' });
+        return sendError(res, 404, 'File not found');
       }
 
       // Generate signed URL for reading/downloading
@@ -2149,10 +2097,7 @@ exports.getSignedDownloadUrl_v2 = onRequest(
 
     } catch (error) {
       console.error('Failed to generate signed download URL:', error);
-      return res.status(500).json({
-        error: 'Failed to generate download URL',
-        details: error.message
-      });
+      return sendError(res, 500, 'Failed to generate download URL', { details: error.message });
     }
   }
 );
@@ -2244,22 +2189,14 @@ function buildFinancialEntry({ type, category, amount, date, description, source
 // Blue-green deployment: v2 functions run alongside v1
 // Old function name: addFinancialEntry
 exports.addFinancialEntry_v2 = onRequest(
-  {
-    region: REGION,
-    serviceAccount: SERVICE_ACCOUNT_EMAIL,
-    cors: true,
-    timeoutSeconds: 60,
-    memory: '256MiB'
-  },
+  HTTP_OPTS,
   async (req, res) => {
-    if (req.method !== 'POST') {
-      return res.status(405).json({ error: 'Method not allowed. Use POST.' });
-    }
+    if (!requireMethod(req, res, 'POST')) return;
 
     // Authenticate
     const authResult = await authenticateRequest(req);
     if (authResult.error) {
-      return res.status(authResult.status).json({ error: authResult.error });
+      return sendError(res, authResult.status, authResult.error);
     }
     const user = authResult.user;
 
@@ -2267,10 +2204,7 @@ exports.addFinancialEntry_v2 = onRequest(
     const body = req.body || {};
     const validationErrors = validateFinancialEntryRequest(body);
     if (validationErrors.length > 0) {
-      return res.status(400).json({
-        error: 'Validation failed',
-        details: validationErrors
-      });
+      return sendError(res, 400, 'Validation failed', { details: validationErrors });
     }
 
     try {
@@ -2300,10 +2234,7 @@ exports.addFinancialEntry_v2 = onRequest(
 
     } catch (error) {
       console.error('Failed to add financial entry:', error);
-      return res.status(500).json({
-        error: 'Failed to add financial entry',
-        details: error.message
-      });
+      return sendError(res, 500, 'Failed to add financial entry', { details: error.message });
     }
   }
 );
@@ -2323,27 +2254,19 @@ exports.addFinancialEntry_v2 = onRequest(
 // Blue-green deployment: v2 functions run alongside v1
 // Old function name: deleteFinancialEntry
 exports.deleteFinancialEntry_v2 = onRequest(
-  {
-    region: REGION,
-    serviceAccount: SERVICE_ACCOUNT_EMAIL,
-    cors: true,
-    timeoutSeconds: 60,
-    memory: '256MiB'
-  },
+  HTTP_OPTS,
   async (req, res) => {
-    if (req.method !== 'POST') {
-      return res.status(405).json({ error: 'Method not allowed. Use POST.' });
-    }
+    if (!requireMethod(req, res, 'POST')) return;
 
     const authResult = await authenticateRequest(req);
     if (authResult.error) {
-      return res.status(authResult.status).json({ error: authResult.error });
+      return sendError(res, authResult.status, authResult.error);
     }
     const user = authResult.user;
 
     const { entryId } = req.body || {};
     if (!entryId || typeof entryId !== 'string') {
-      return res.status(400).json({ error: 'entryId is required and must be a string' });
+      return sendError(res, 400, 'entryId is required and must be a string');
     }
 
     try {
@@ -2351,7 +2274,7 @@ exports.deleteFinancialEntry_v2 = onRequest(
       const entrySnap = await entryRef.get();
 
       if (!entrySnap.exists) {
-        return res.status(404).json({ error: 'Entry not found' });
+        return sendError(res, 404, 'Entry not found');
       }
 
       await entryRef.update({
@@ -2371,10 +2294,7 @@ exports.deleteFinancialEntry_v2 = onRequest(
 
     } catch (error) {
       console.error('Failed to delete financial entry:', error);
-      return res.status(500).json({
-        error: 'Failed to delete entry',
-        details: error.message
-      });
+      return sendError(res, 500, 'Failed to delete entry', { details: error.message });
     }
   }
 );
@@ -2397,27 +2317,19 @@ exports.deleteFinancialEntry_v2 = onRequest(
 // Blue-green deployment: v2 functions run alongside v1
 // Old function name: getFinancialReport
 exports.getFinancialReport_v2 = onRequest(
-  {
-    region: REGION,
-    serviceAccount: SERVICE_ACCOUNT_EMAIL,
-    cors: true,
-    timeoutSeconds: 60,
-    memory: '256MiB'
-  },
+  HTTP_OPTS,
   async (req, res) => {
-    if (req.method !== 'POST') {
-      return res.status(405).json({ error: 'Method not allowed. Use POST.' });
-    }
+    if (!requireMethod(req, res, 'POST')) return;
 
     const authResult = await authenticateRequest(req);
     if (authResult.error) {
-      return res.status(authResult.status).json({ error: authResult.error });
+      return sendError(res, authResult.status, authResult.error);
     }
 
     const { startDate, endDate, type, includeDeleted } = req.body || {};
 
     if (!startDate || !endDate) {
-      return res.status(400).json({ error: 'startDate and endDate are required' });
+      return sendError(res, 400, 'startDate and endDate are required');
     }
 
     const start = new Date(startDate);
@@ -2425,7 +2337,7 @@ exports.getFinancialReport_v2 = onRequest(
     end.setHours(23, 59, 59, 999); // Include entire end day
 
     if (isNaN(start.getTime()) || isNaN(end.getTime())) {
-      return res.status(400).json({ error: 'Invalid date format' });
+      return sendError(res, 400, 'Invalid date format');
     }
 
     try {
@@ -2492,10 +2404,7 @@ exports.getFinancialReport_v2 = onRequest(
 
     } catch (error) {
       console.error('Failed to get financial report:', error);
-      return res.status(500).json({
-        error: 'Failed to get report',
-        details: error.message
-      });
+      return sendError(res, 500, 'Failed to get report', { details: error.message });
     }
   }
 );
@@ -2547,31 +2456,20 @@ function validateRecurringExpenseRequest(body) {
 // Blue-green deployment: v2 functions run alongside v1
 // Old function name: addRecurringExpense
 exports.addRecurringExpense_v2 = onRequest(
-  {
-    region: REGION,
-    serviceAccount: SERVICE_ACCOUNT_EMAIL,
-    cors: true,
-    timeoutSeconds: 60,
-    memory: '256MiB'
-  },
+  HTTP_OPTS,
   async (req, res) => {
-    if (req.method !== 'POST') {
-      return res.status(405).json({ error: 'Method not allowed. Use POST.' });
-    }
+    if (!requireMethod(req, res, 'POST')) return;
 
     const authResult = await authenticateRequest(req);
     if (authResult.error) {
-      return res.status(authResult.status).json({ error: authResult.error });
+      return sendError(res, authResult.status, authResult.error);
     }
     const user = authResult.user;
 
     const body = req.body || {};
     const validationErrors = validateRecurringExpenseRequest(body);
     if (validationErrors.length > 0) {
-      return res.status(400).json({
-        error: 'Validation failed',
-        details: validationErrors
-      });
+      return sendError(res, 400, 'Validation failed', { details: validationErrors });
     }
 
     try {
@@ -2601,10 +2499,7 @@ exports.addRecurringExpense_v2 = onRequest(
 
     } catch (error) {
       console.error('Failed to add recurring expense:', error);
-      return res.status(500).json({
-        error: 'Failed to add recurring expense',
-        details: error.message
-      });
+      return sendError(res, 500, 'Failed to add recurring expense', { details: error.message });
     }
   }
 );
@@ -2630,32 +2525,24 @@ exports.addRecurringExpense_v2 = onRequest(
 // Blue-green deployment: v2 functions run alongside v1
 // Old function name: updateRecurringExpense
 exports.updateRecurringExpense_v2 = onRequest(
-  {
-    region: REGION,
-    serviceAccount: SERVICE_ACCOUNT_EMAIL,
-    cors: true,
-    timeoutSeconds: 60,
-    memory: '256MiB'
-  },
+  HTTP_OPTS,
   async (req, res) => {
-    if (req.method !== 'POST') {
-      return res.status(405).json({ error: 'Method not allowed. Use POST.' });
-    }
+    if (!requireMethod(req, res, 'POST')) return;
 
     const authResult = await authenticateRequest(req);
     if (authResult.error) {
-      return res.status(authResult.status).json({ error: authResult.error });
+      return sendError(res, authResult.status, authResult.error);
     }
     const user = authResult.user;
 
     const { recurringId, fields } = req.body || {};
 
     if (!recurringId || typeof recurringId !== 'string') {
-      return res.status(400).json({ error: 'recurringId is required' });
+      return sendError(res, 400, 'recurringId is required');
     }
 
     if (!fields || typeof fields !== 'object') {
-      return res.status(400).json({ error: 'fields is required and must be an object' });
+      return sendError(res, 400, 'fields is required and must be an object');
     }
 
     // Validate fields
@@ -2674,7 +2561,7 @@ exports.updateRecurringExpense_v2 = onRequest(
     }
 
     if (errors.length > 0) {
-      return res.status(400).json({ error: 'Validation failed', details: errors });
+      return sendError(res, 400, 'Validation failed', { details: errors });
     }
 
     try {
@@ -2682,7 +2569,7 @@ exports.updateRecurringExpense_v2 = onRequest(
       const recurringSnap = await recurringRef.get();
 
       if (!recurringSnap.exists) {
-        return res.status(404).json({ error: 'Recurring expense not found' });
+        return sendError(res, 404, 'Recurring expense not found');
       }
 
       const updates = {
@@ -2707,10 +2594,7 @@ exports.updateRecurringExpense_v2 = onRequest(
 
     } catch (error) {
       console.error('Failed to update recurring expense:', error);
-      return res.status(500).json({
-        error: 'Failed to update recurring expense',
-        details: error.message
-      });
+      return sendError(res, 500, 'Failed to update recurring expense', { details: error.message });
     }
   }
 );
@@ -2798,21 +2682,13 @@ exports.processRecurringExpenses_v2 = onSchedule(
 // Blue-green deployment: v2 functions run alongside v1
 // Old function name: getRecurringExpenses
 exports.getRecurringExpenses_v2 = onRequest(
-  {
-    region: REGION,
-    serviceAccount: SERVICE_ACCOUNT_EMAIL,
-    cors: true,
-    timeoutSeconds: 60,
-    memory: '256MiB'
-  },
+  HTTP_OPTS,
   async (req, res) => {
-    if (req.method !== 'GET') {
-      return res.status(405).json({ error: 'Method not allowed. Use GET.' });
-    }
+    if (!requireMethod(req, res, 'GET')) return;
 
     const authResult = await authenticateRequest(req);
     if (authResult.error) {
-      return res.status(authResult.status).json({ error: authResult.error });
+      return sendError(res, authResult.status, authResult.error);
     }
 
     try {
@@ -2835,10 +2711,7 @@ exports.getRecurringExpenses_v2 = onRequest(
 
     } catch (error) {
       console.error('Failed to get recurring expenses:', error);
-      return res.status(500).json({
-        error: 'Failed to get recurring expenses',
-        details: error.message
-      });
+      return sendError(res, 500, 'Failed to get recurring expenses', { details: error.message });
     }
   }
 );
