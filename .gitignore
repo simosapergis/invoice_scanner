@@ -3,4 +3,5 @@ node_modules/
 .DS_Store
 invoice.*
 firebase-debug.log
+update-env-*.sh
 

@@ -100,3 +100,4 @@
 - Don't modify `update-env-default.sh` or `update-env-prod.sh` (they contain secrets context).
 - Don't commit `.env` files or API keys.
 - Don't use callback-style async code.
+- Don't add `Co-authored-by` trailers (or any other trailers) to git commit messages.
