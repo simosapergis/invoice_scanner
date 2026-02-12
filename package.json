@@ -10,6 +10,9 @@
     "signed-url:server": "node signed_url_server.js",
     "upload:invoice": "node upload_invoice.js"
   },
+  "engines": {
+    "node": ">=22.0.0"
+  },
   "dependencies": {
     "@google-cloud/storage": "^7.11.1",
     "@google-cloud/vision": "^5.3.4",

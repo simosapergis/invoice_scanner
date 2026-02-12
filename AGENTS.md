@@ -4,7 +4,7 @@
 
 - **Greek invoice scanning backend** built on Firebase Cloud Functions (Gen 2) with CLI utilities.
 - No frontend in this repo — the PWA client lives in a separate project.
-- **Runtime**: Node.js 20, ESM modules (`"type": "module"` in `package.json`).
+- **Runtime**: Node.js 22, ESM modules (`"type": "module"` in `package.json`).
 
 ## 2. Architecture
 
