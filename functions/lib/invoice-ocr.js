@@ -1,5 +1,5 @@
-const OpenAI = require('openai');
-const { admin, visionClient, OPENAI_API_KEY } = require('./config.js');
+import OpenAI from 'openai';
+import { admin, visionClient, OPENAI_API_KEY } from './config.js';
 
 const REQUIRED_FIELDS = [
   'ΗΜΕΡΟΜΗΝΙΑ',
@@ -9,32 +9,29 @@ const REQUIRED_FIELDS = [
   'ΚΑΘΑΡΗ ΑΞΙΑ',
   'ΦΠΑ',
   'ΠΛΗΡΩΤΕΟ',
-  'ΑΚΡΙΒΕΙΑ'
+  'ΑΚΡΙΒΕΙΑ',
 ];
 
 const FIELD_LABELS = {
-  'ΗΜΕΡΟΜΗΝΙΑ': 'invoiceDate',
+  ΗΜΕΡΟΜΗΝΙΑ: 'invoiceDate',
   'ΑΡΙΘΜΟΣ ΤΙΜΟΛΟΓΙΟΥ': 'invoiceNumber',
-  'ΠΡΟΜΗΘΕΥΤΗΣ': 'supplierName',
+  ΠΡΟΜΗΘΕΥΤΗΣ: 'supplierName',
   'ΑΦΜ ΠΡΟΜΗΘΕΥΤΗ': 'supplierTaxNumber',
   'ΚΑΘΑΡΗ ΑΞΙΑ': 'netAmount',
-  'ΦΠΑ': 'vat',
-  'ΠΛΗΡΩΤΕΟ': 'totalAmount',
-  'ΑΚΡΙΒΕΙΑ': 'confidence'
+  ΦΠΑ: 'vat',
+  ΠΛΗΡΩΤΕΟ: 'totalAmount',
+  ΑΚΡΙΒΕΙΑ: 'confidence',
 };
 
-const METADATA_ERROR_MESSAGE = "❌ Aποτυχία τιμολογίου ΤΔΑ-%s από %s. %s";
-const METADATA_SUCCESS_MESSAGE = "✅ Επιτυχία τιμολογίου ΤΔΑ-%s από %s.";
+const METADATA_ERROR_MESSAGE = '❌ Aποτυχία τιμολογίου ΤΔΑ-%s από %s. %s';
+const METADATA_SUCCESS_MESSAGE = '✅ Επιτυχία τιμολογίου ΤΔΑ-%s από %s.';
 
 /**
  * Formats error message with prefix if invoiceNumber and supplierName are known.
  */
 function formatMetadataError(invoiceNumber, supplierName, errorMsg) {
   if (invoiceNumber && supplierName && supplierName !== 'Unknown Supplier') {
-    return METADATA_ERROR_MESSAGE
-      .replace('%s', invoiceNumber)
-      .replace('%s', supplierName)
-      .replace('%s', errorMsg);
+    return METADATA_ERROR_MESSAGE.replace('%s', invoiceNumber).replace('%s', supplierName).replace('%s', errorMsg);
   }
   return errorMsg;
 }
@@ -43,9 +40,7 @@ function formatMetadataError(invoiceNumber, supplierName, errorMsg) {
  * Formats success message with invoiceNumber and supplierName.
  */
 function formatMetadataSuccess(invoiceNumber, supplierName) {
-    return METADATA_SUCCESS_MESSAGE
-      .replace('%s', invoiceNumber)
-      .replace('%s', supplierName);
+  return METADATA_SUCCESS_MESSAGE.replace('%s', invoiceNumber).replace('%s', supplierName);
 }
 
 // Initialize OpenAI client - params are evaluated lazily
@@ -105,7 +100,7 @@ function parseAmount(value) {
   if (value === null || value === undefined) return null;
 
   // Remove everything except digits, dot, and minus (decimals already normalized before GPT)
-  const str = value.toString().replace(/[^\d.\-]/g, '');
+  const str = value.toString().replace(/[^\d.-]/g, '');
   if (!str) return null;
 
   const num = Number(str);
@@ -116,28 +111,20 @@ function parseDate(value) {
   if (!value) return null;
 
   // European format: dd/mm/yyyy or dd-mm-yyyy
-  const euMatch = value.match(/^(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})$/);
+  const euMatch = value.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/);
   if (euMatch) {
     const [, day, month, year] = euMatch;
-    const date = new Date(Date.UTC(
-      parseInt(year, 10),
-      parseInt(month, 10) - 1,
-      parseInt(day, 10)
-    ));
+    const date = new Date(Date.UTC(parseInt(year, 10), parseInt(month, 10) - 1, parseInt(day, 10)));
     if (!Number.isNaN(date.getTime())) {
       return admin.firestore.Timestamp.fromDate(date);
     }
   }
 
   // ISO format: yyyy-mm-dd
-  const isoMatch = value.match(/^(\d{4})[/\-](\d{1,2})[/\-](\d{1,2})$/);
+  const isoMatch = value.match(/^(\d{4})[/-](\d{1,2})[/-](\d{1,2})$/);
   if (isoMatch) {
     const [, year, month, day] = isoMatch;
-    const date = new Date(Date.UTC(
-      parseInt(year, 10),
-      parseInt(month, 10) - 1,
-      parseInt(day, 10)
-    ));
+    const date = new Date(Date.UTC(parseInt(year, 10), parseInt(month, 10) - 1, parseInt(day, 10)));
     if (!Number.isNaN(date.getTime())) {
       return admin.firestore.Timestamp.fromDate(date);
     }
@@ -188,16 +175,13 @@ async function runInvoiceOcrAttempt(pageBuffers) {
   for (const page of pageBuffers) {
     const mimeType = page.mimeType || 'application/octet-stream';
     if (mimeType === 'application/pdf') {
-      console.warn(
-        `Skipping PDF page ${page.pageNumber} for Vision OCR; expected image formats.`,
-        { mimeType }
-      );
+      console.warn(`Skipping PDF page ${page.pageNumber} for Vision OCR; expected image formats.`, { mimeType });
       continue;
     }
 
     try {
       const [visionResult] = await visionClient.documentTextDetection({
-        image: { content: page.buffer }
+        image: { content: page.buffer },
       });
       const pageText = visionResult?.fullTextAnnotation?.text?.trim();
       if (pageText) {
@@ -218,7 +202,6 @@ async function runInvoiceOcrAttempt(pageBuffers) {
 
   // Normalize European decimals (2.383,13 → 2383.13) before GPT
   const fullText = normalizeEuropeanDecimals(ocrText);
-
 
   const systemPrompt = [
     'You are an expert accountant and document-analysis specialist for Greek invoices.',
@@ -248,7 +231,7 @@ async function runInvoiceOcrAttempt(pageBuffers) {
     '   - Supplier information ALWAYS appears on page 1.',
     '   - Financial totals (Net, VAT, Payable) ALWAYS appear on the LAST page.',
     '   - Do NOT mix totals from earlier pages.',
-    '   - If multiple candidates appear, prefer the last page\'s values.',
+    "   - If multiple candidates appear, prefer the last page's values.",
     '',
     '3. Supplier (ΠΡΟΜΗΘΕΥΤΗΣ):',
     '   - The supplier is the ISSUING company shown in the document header (top area of page 1).',
@@ -326,7 +309,7 @@ async function runInvoiceOcrAttempt(pageBuffers) {
     '===========================',
     'Think step-by-step INTERNALLY.',
     'Do NOT include reasoning in the output.',
-    'Output ONLY the final JSON.'
+    'Output ONLY the final JSON.',
   ].join('\n');
 
   const extractionPrompt =
@@ -347,21 +330,18 @@ async function runInvoiceOcrAttempt(pageBuffers) {
     '- Χρησιμοποίησε δεκαδικό με τελεία.\n\n' +
     'Ακολουθεί το κείμενο του τιμολογίου:\n\n' +
     fullText;
-    
 
   const response = await client.responses.create({
     model: 'gpt-4o-mini',
     input: [
       {
         role: 'system',
-        content: [{ type: 'input_text', text: systemPrompt }]
+        content: [{ type: 'input_text', text: systemPrompt }],
       },
       {
         role: 'user',
-        content: [
-          { type: 'input_text', text: extractionPrompt }
-        ]
-      }
+        content: [{ type: 'input_text', text: extractionPrompt }],
+      },
     ],
     text: {
       format: {
@@ -371,28 +351,28 @@ async function runInvoiceOcrAttempt(pageBuffers) {
           type: 'object',
           additionalProperties: false,
           properties: {
-            'ΗΜΕΡΟΜΗΝΙΑ': { type: ['string', 'null'] },
+            ΗΜΕΡΟΜΗΝΙΑ: { type: ['string', 'null'] },
             'ΑΡΙΘΜΟΣ ΤΙΜΟΛΟΓΙΟΥ': { type: ['string', 'null'] },
             'ΑΦΜ ΠΡΟΜΗΘΕΥΤΗ': { type: ['string', 'null'] },
-            'ΠΡΟΜΗΘΕΥΤΗΣ': { type: ['string', 'null'] },
+            ΠΡΟΜΗΘΕΥΤΗΣ: { type: ['string', 'null'] },
             'ΚΑΘΑΡΗ ΑΞΙΑ': { type: ['string', 'null'] },
-            'ΦΠΑ': { type: ['string', 'null'] },
-            'ΠΛΗΡΩΤΕΟ': { type: ['string', 'null'] },
-            'ΑΚΡΙΒΕΙΑ': { type: ['string', 'null'] }
+            ΦΠΑ: { type: ['string', 'null'] },
+            ΠΛΗΡΩΤΕΟ: { type: ['string', 'null'] },
+            ΑΚΡΙΒΕΙΑ: { type: ['string', 'null'] },
           },
-          required: REQUIRED_FIELDS
+          required: REQUIRED_FIELDS,
         },
-        strict: true
-      }
+        strict: true,
+      },
     },
-    max_output_tokens: 800
+    max_output_tokens: 800,
   });
 
   const rawText = collectResponseText(response);
   return parseJsonFromResponse(rawText);
 }
 
-module.exports = {
+export {
   REQUIRED_FIELDS,
   FIELD_LABELS,
   METADATA_ERROR_MESSAGE,

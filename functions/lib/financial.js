@@ -1,40 +1,40 @@
-const { admin, serverTimestamp } = require('./config.js');
+import { admin, serverTimestamp } from './config.js';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // FINANCIAL TRACKING CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════════
 const FINANCIAL_ENTRIES_COLLECTION = 'financial_entries';
 //TODO: add financial summaries collection in case there is a performance issue
-// const FINANCIAL_SUMMARIES_COLLECTION = 'financial_summaries'; 
+// const FINANCIAL_SUMMARIES_COLLECTION = 'financial_summaries';
 const RECURRING_EXPENSES_COLLECTION = 'recurring_expenses';
 
 const ENTRY_TYPE = {
   income: 'income',
-  expense: 'expense'
+  expense: 'expense',
 };
 
 const ENTRY_SOURCE = {
   manual: 'manual',
   invoicePayment: 'invoice_payment',
-  recurring: 'recurring'
+  recurring: 'recurring',
 };
 
 // Income categories
 const INCOME_CATEGORY = {
   cashSales: 'cash_sales',
   cardSales: 'card_sales',
-  otherIncome: 'other_income'
+  otherIncome: 'other_income',
 };
 
 // Expense categories - ΠΑΓΙΑ ΜΗΝΑ (Fixed Monthly) + Invoice Payments
 const EXPENSE_CATEGORY = {
-  electricity: 'ΡΕΥΜΑ',           // Electricity
-  telecom: 'ΤΗΛΕΦΩΝΙΑ',               // Telecom
-  rent: 'ΕΝΟΙΚΙΟ',              // Rent
-  salaries: 'ΜΙΣΘΟΙ',        // Staff/Salaries
-  accountant: 'ΛΟΓΙΣΤΗΣ',       // Accountant
-  invoicePayment: 'ΠΛΗΡΩΜΗ_ΤΙΜΟΛΟΓΙΟΥ',  // Invoice Payment (auto-generated)
-  other: 'ΑΛΛΑ'                 // Other
+  electricity: 'ΡΕΥΜΑ', // Electricity
+  telecom: 'ΤΗΛΕΦΩΝΙΑ', // Telecom
+  rent: 'ΕΝΟΙΚΙΟ', // Rent
+  salaries: 'ΜΙΣΘΟΙ', // Staff/Salaries
+  accountant: 'ΛΟΓΙΣΤΗΣ', // Accountant
+  invoicePayment: 'ΠΛΗΡΩΜΗ_ΤΙΜΟΛΟΓΙΟΥ', // Invoice Payment (auto-generated)
+  other: 'ΑΛΛΑ', // Other
 };
 
 const VALID_INCOME_CATEGORIES = Object.values(INCOME_CATEGORY);
@@ -100,11 +100,11 @@ function buildFinancialEntry({ type, category, amount, date, description, source
     isDeleted: false,
     createdBy: userId,
     createdAt: serverTimestamp(),
-    updatedAt: serverTimestamp()
+    updatedAt: serverTimestamp(),
   };
 }
 
-module.exports = {
+export {
   FINANCIAL_ENTRIES_COLLECTION,
   RECURRING_EXPENSES_COLLECTION,
   ENTRY_TYPE,

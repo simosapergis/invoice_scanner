@@ -1,4 +1,4 @@
-const {
+import {
   admin,
   db,
   storage,
@@ -7,9 +7,9 @@ const {
   UPLOADS_PREFIX,
   serverTimestamp,
   getBucketName,
-} = require('./config.js');
-const { sanitizeId } = require('./invoice-upload.js');
-const {
+} from './config.js';
+import { sanitizeId } from './invoice-upload.js';
+import {
   FIELD_LABELS,
   formatMetadataError,
   formatMetadataSuccess,
@@ -17,9 +17,9 @@ const {
   parseAmount,
   parseDate,
   runInvoiceOcr,
-} = require('./invoice-ocr.js');
-const { buildCombinedPdfFromPages } = require('./invoice-pdf.js');
-const { ensureSupplierProfile } = require('./suppliers.js');
+} from './invoice-ocr.js';
+import { buildCombinedPdfFromPages } from './invoice-pdf.js';
+import { ensureSupplierProfile } from './suppliers.js';
 
 /**
  * Core handler for processInvoiceDocument_v2.
@@ -49,7 +49,7 @@ async function processInvoiceDocumentHandler(event) {
     await change.after.ref.update({
       status: INVOICE_STATUS.error,
       errorMessage: 'Αποτυχία OCR, το OPENAI_API_KEY λείπει.',
-      updatedAt: serverTimestamp()
+      updatedAt: serverTimestamp(),
     });
     return;
   }
@@ -67,7 +67,7 @@ async function processInvoiceDocumentHandler(event) {
         status: INVOICE_STATUS.processing,
         processingStartedAt: serverTimestamp(),
         errorMessage: null,
-        updatedAt: serverTimestamp()
+        updatedAt: serverTimestamp(),
       });
 
       return lockedData;
@@ -88,7 +88,7 @@ async function processInvoiceDocumentHandler(event) {
     await change.after.ref.update({
       status: INVOICE_STATUS.error,
       errorMessage: 'Λείπει η ρύθμιση του bucket για την επεξεργασία τιμολογίου.',
-      updatedAt: serverTimestamp()
+      updatedAt: serverTimestamp(),
     });
     return;
   }
@@ -101,7 +101,7 @@ async function processInvoiceDocumentHandler(event) {
     await change.after.ref.update({
       status: INVOICE_STATUS.error,
       errorMessage: 'Δεν έγινε ανέβασμα τιμολογίου.',
-      updatedAt: serverTimestamp()
+      updatedAt: serverTimestamp(),
     });
     return;
   }
@@ -110,7 +110,7 @@ async function processInvoiceDocumentHandler(event) {
     await change.after.ref.update({
       status: INVOICE_STATUS.error,
       errorMessage: `Αναμενόταν ${invoiceData.totalPages} σελίδες αλλά βρέθηκαν ${pages.length}.`,
-      updatedAt: serverTimestamp()
+      updatedAt: serverTimestamp(),
     });
     return;
   }
@@ -120,14 +120,11 @@ async function processInvoiceDocumentHandler(event) {
   let invoiceNumber = null;
 
   try {
-    const { combinedPdfBuffer, downloadedPages } = await buildCombinedPdfFromPages(
-      pages,
-      bucketName
-    );
+    const { combinedPdfBuffer, downloadedPages } = await buildCombinedPdfFromPages(pages, bucketName);
 
     // At this stage of the app, in order to avoid noise and extra charges from the Vision API
-    // and GPT, we will only OCR the first and last page of the invoice 
-    // since the supplier info, invoice number, date are on the first page 
+    // and GPT, we will only OCR the first and last page of the invoice
+    // since the supplier info, invoice number, date are on the first page
     // and the totals, amounts are on the last page. (MVP)
     // For invoices with more than 2 pages, OCR only first and last page
     // Page 1 = supplier info, invoice number, date
@@ -159,17 +156,14 @@ async function processInvoiceDocumentHandler(event) {
 
     supplierName = mappedResult.supplierName || 'Unknown Supplier';
     const supplierTaxNumber = mappedResult.supplierTaxNumber || null;
-    const supplierId = sanitizeId(
-      supplierTaxNumber,
-      sanitizeId(supplierName, 'unknown-supplier')
-    );
+    const supplierId = sanitizeId(supplierTaxNumber, sanitizeId(supplierName, 'unknown-supplier'));
     invoiceNumber = mappedResult.invoiceNumber?.toString().match(/\d+/g)?.join('') || null;
     const uploadedBy = invoiceData.ownerUid || null;
     await ensureSupplierProfile({
       supplierId,
       supplierName,
       supplierTaxNumber,
-      supplierCategory: mappedResult.supplierCategory || null
+      supplierCategory: mappedResult.supplierCategory || null,
     });
 
     // Check for duplicate invoice (same supplier + invoice number, only against done invoices)
@@ -187,16 +181,16 @@ async function processInvoiceDocumentHandler(event) {
         const existingInvoice = duplicateQuery.docs[0];
         const baseError = `Διπλότυπο τιμολόγιο (υπάρχον: ${existingInvoice.id})`;
         const errorMessage = formatMetadataError(invoiceNumber, supplierName, baseError);
-        
+
         console.error(errorMessage);
-        
+
         await change.after.ref.update({
           status: INVOICE_STATUS.error,
           errorMessage,
           duplicateOf: existingInvoice.id,
           detectedInvoiceNumber: invoiceNumber,
           detectedSupplierId: supplierId,
-          updatedAt: serverTimestamp()
+          updatedAt: serverTimestamp(),
         });
 
         return;
@@ -213,8 +207,8 @@ async function processInvoiceDocumentHandler(event) {
           contentType: 'application/pdf',
           metadata: {
             pages: pages.length,
-            originalFolder: invoiceData.storageFolder || `${UPLOADS_PREFIX}${invoiceId}`
-          }
+            originalFolder: invoiceData.storageFolder || `${UPLOADS_PREFIX}${invoiceId}`,
+          },
         });
       console.log(`Stored normalized PDF at gs://${bucketName}/${pdfObjectPath}`);
     } catch (pdfError) {
@@ -222,7 +216,7 @@ async function processInvoiceDocumentHandler(event) {
     }
 
     const invoiceDocRef = db.doc(`suppliers/${supplierId}/invoices/${invoiceId}`);
-    
+
     // Store original OCR data for reference when user edits fields
     const ocrData = {
       supplierName,
@@ -236,7 +230,7 @@ async function processInvoiceDocumentHandler(event) {
       vatAmount: mappedResult.vat || null,
       vatRate: mappedResult.vatRate || null,
       confidence: mappedResult.confidence ? Number(mappedResult.confidence) : null,
-      extractedAt: admin.firestore.Timestamp.now()
+      extractedAt: admin.firestore.Timestamp.now(),
     };
 
     const invoicePayload = {
@@ -263,7 +257,7 @@ async function processInvoiceDocumentHandler(event) {
       confidence: mappedResult.confidence ? Number(mappedResult.confidence) : null,
       ocr: ocrData,
       createdAt: invoiceData.createdAt || serverTimestamp(),
-      uploadedAt: serverTimestamp()
+      uploadedAt: serverTimestamp(),
     };
 
     await invoiceDocRef.set(invoicePayload, { merge: true });
@@ -275,7 +269,7 @@ async function processInvoiceDocumentHandler(event) {
       confidence: invoicePayload.confidence,
       errorMessage: null,
       successMessage: formatMetadataSuccess(invoiceNumber, supplierName),
-      updatedAt: serverTimestamp()
+      updatedAt: serverTimestamp(),
     });
 
     console.log(`Stored invoice data at ${invoiceDocRef.path}`);
@@ -288,13 +282,11 @@ async function processInvoiceDocumentHandler(event) {
     await change.after.ref.update({
       status: INVOICE_STATUS.error,
       errorMessage,
-      updatedAt: serverTimestamp()
+      updatedAt: serverTimestamp(),
     });
 
     // TODO: send notification on error
   }
 }
 
-module.exports = {
-  processInvoiceDocumentHandler,
-};
+export { processInvoiceDocumentHandler };

@@ -1,13 +1,8 @@
-const { db, serverTimestamp } = require('./config.js');
+import { db, serverTimestamp } from './config.js';
 
 const EDITABLE_SUPPLIER_FIELDS = ['name', 'supplierCategory', 'supplierTaxNumber', 'delivery'];
 
-async function ensureSupplierProfile({
-  supplierId,
-  supplierName,
-  supplierTaxNumber,
-  supplierCategory
-}) {
+async function ensureSupplierProfile({ supplierId, supplierName, supplierTaxNumber, supplierCategory }) {
   if (!supplierId) {
     console.warn('Missing supplierId; skipping supplier profile update.');
     return;
@@ -25,7 +20,7 @@ async function ensureSupplierProfile({
           supplierCategory: supplierCategory || null,
           supplierTaxNumber: supplierTaxNumber || null,
           createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp()
+          updatedAt: serverTimestamp(),
         });
         return;
       }
@@ -83,7 +78,12 @@ function validateDeliveryObject(delivery, errors) {
 
   // Validate dayOfWeek (1-7, ISO 8601)
   if (delivery.dayOfWeek !== undefined) {
-    if (typeof delivery.dayOfWeek !== 'number' || !Number.isInteger(delivery.dayOfWeek) || delivery.dayOfWeek < 1 || delivery.dayOfWeek > 7) {
+    if (
+      typeof delivery.dayOfWeek !== 'number' ||
+      !Number.isInteger(delivery.dayOfWeek) ||
+      delivery.dayOfWeek < 1 ||
+      delivery.dayOfWeek > 7
+    ) {
       errors.push('fields.delivery.dayOfWeek must be an integer between 1 (Monday) and 7 (Sunday)');
     }
   }
@@ -142,7 +142,7 @@ function validateUpdateSupplierRequest(body) {
 
   // Check for unknown fields
   const providedFields = Object.keys(fields);
-  const unknownFields = providedFields.filter(f => !EDITABLE_SUPPLIER_FIELDS.includes(f));
+  const unknownFields = providedFields.filter((f) => !EDITABLE_SUPPLIER_FIELDS.includes(f));
   if (unknownFields.length > 0) {
     errors.push(`Unknown fields: ${unknownFields.join(', ')}. Allowed: ${EDITABLE_SUPPLIER_FIELDS.join(', ')}`);
   }
@@ -150,7 +150,7 @@ function validateUpdateSupplierRequest(body) {
   return errors;
 }
 
-module.exports = {
+export {
   EDITABLE_SUPPLIER_FIELDS,
   ensureSupplierProfile,
   validateTimeObject,

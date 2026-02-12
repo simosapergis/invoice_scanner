@@ -1,4 +1,4 @@
-const { PAYMENT_STATUS } = require('./config.js');
+import { PAYMENT_STATUS } from './config.js';
 
 /**
  * Validates payment request body
@@ -72,7 +72,7 @@ const EDITABLE_INVOICE_FIELDS = [
   'vatAmount',
   'vatRate',
   'paidAmount',
-  'currency'
+  'currency',
 ];
 
 /**
@@ -142,7 +142,7 @@ function validateUpdateFieldsRequest(body) {
 
   // Check for unknown fields
   const providedFields = Object.keys(fields);
-  const unknownFields = providedFields.filter(f => !EDITABLE_INVOICE_FIELDS.includes(f));
+  const unknownFields = providedFields.filter((f) => !EDITABLE_INVOICE_FIELDS.includes(f));
   if (unknownFields.length > 0) {
     errors.push(`Unknown fields: ${unknownFields.join(', ')}. Allowed: ${EDITABLE_INVOICE_FIELDS.join(', ')}`);
   }
@@ -150,9 +150,4 @@ function validateUpdateFieldsRequest(body) {
   return errors;
 }
 
-module.exports = {
-  validatePaymentRequest,
-  derivePaymentStatus,
-  EDITABLE_INVOICE_FIELDS,
-  validateUpdateFieldsRequest,
-};
+export { validatePaymentRequest, derivePaymentStatus, EDITABLE_INVOICE_FIELDS, validateUpdateFieldsRequest };

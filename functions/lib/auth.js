@@ -1,4 +1,4 @@
-const { admin } = require('./config.js');
+import { admin } from './config.js';
 
 function extractBearerToken(headerValue) {
   if (!headerValue) return null;
@@ -23,7 +23,4 @@ async function authenticateRequest(req) {
   }
 }
 
-module.exports = {
-  extractBearerToken,
-  authenticateRequest,
-};
+export { extractBearerToken, authenticateRequest };

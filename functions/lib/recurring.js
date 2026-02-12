@@ -1,4 +1,4 @@
-const { VALID_EXPENSE_CATEGORIES } = require('./financial.js');
+import { VALID_EXPENSE_CATEGORIES } from './financial.js';
 
 /**
  * Validates recurring expense request
@@ -25,6 +25,4 @@ function validateRecurringExpenseRequest(body) {
   return errors;
 }
 
-module.exports = {
-  validateRecurringExpenseRequest,
-};
+export { validateRecurringExpenseRequest };

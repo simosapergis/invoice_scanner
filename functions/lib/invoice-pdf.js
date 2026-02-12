@@ -1,5 +1,5 @@
-const { PDFDocument } = require('pdf-lib');
-const { storage } = require('./config.js');
+import { PDFDocument } from 'pdf-lib';
+import { storage } from './config.js';
 
 async function convertBufferToPdf(buffer, mimeType = 'image/jpeg') {
   if (mimeType === 'application/pdf') {
@@ -49,7 +49,7 @@ async function buildCombinedPdfFromPages(pageEntries, defaultBucket) {
       buffer,
       mimeType,
       objectName: entry.objectName,
-      bucketName
+      bucketName,
     });
 
     if (mimeType === 'application/pdf') {
@@ -69,11 +69,8 @@ async function buildCombinedPdfFromPages(pageEntries, defaultBucket) {
   const combinedBuffer = await combinedPdf.save();
   return {
     combinedPdfBuffer: Buffer.from(combinedBuffer),
-    downloadedPages
+    downloadedPages,
   };
 }
 
-module.exports = {
-  convertBufferToPdf,
-  buildCombinedPdfFromPages,
-};
+export { convertBufferToPdf, buildCombinedPdfFromPages };

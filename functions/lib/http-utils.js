@@ -1,4 +1,4 @@
-const { REGION, SERVICE_ACCOUNT_EMAIL } = require('./config.js');
+import { REGION, SERVICE_ACCOUNT_EMAIL } from './config.js';
 
 const HTTP_OPTS = {
   region: REGION,
@@ -30,8 +30,4 @@ function sendError(res, status, message, { details, code } = {}) {
   return res.status(status).json(body);
 }
 
-module.exports = {
-  HTTP_OPTS,
-  requireMethod,
-  sendError,
-};
+export { HTTP_OPTS, requireMethod, sendError };

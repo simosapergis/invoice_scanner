@@ -1,7 +1,7 @@
-const admin = require('firebase-admin');
-const { Storage } = require('@google-cloud/storage');
-const vision = require('@google-cloud/vision');
-const { defineString } = require('firebase-functions/params');
+import admin from 'firebase-admin';
+import { Storage } from '@google-cloud/storage';
+import vision from '@google-cloud/vision';
+import { defineString } from 'firebase-functions/params';
 
 admin.initializeApp();
 
@@ -25,12 +25,12 @@ const INVOICE_STATUS = {
   processing: 'processing',
   done: 'done',
   uploaded: 'uploaded',
-  error: 'error'
+  error: 'error',
 };
 const PAYMENT_STATUS = {
   unpaid: 'unpaid',
   paid: 'paid',
-  partiallyPaid: 'partially_paid'
+  partiallyPaid: 'partially_paid',
 };
 
 const serverTimestamp = admin.firestore.FieldValue.serverTimestamp;
@@ -39,7 +39,7 @@ function getBucketName() {
   return GCS_BUCKET.value();
 }
 
-module.exports = {
+export {
   admin,
   db,
   storage,
