@@ -8,7 +8,19 @@
 
 ## 2. Architecture
 
-- **Cloud Functions** live in a single file: `functions/index.js` (~2800 lines).
+- **Cloud Functions** are in `functions/`, modularized as follows:
+  - `functions/index.js` (~1250 lines) — handler wiring: imports lib modules, defines each Cloud Function export.
+  - `functions/lib/config.js` — `admin.initializeApp()`, `defineString` params, shared constants.
+  - `functions/lib/auth.js` — `authenticateRequest`, `extractBearerToken`.
+  - `functions/lib/http-utils.js` — `HTTP_OPTS`, `requireMethod`, `sendError`.
+  - `functions/lib/invoice-upload.js` — `parseUploadObjectName`, `registerUploadedPage`, `ensureInvoiceDocument`.
+  - `functions/lib/invoice-ocr.js` — `runInvoiceOcr`, `runInvoiceOcrAttempt`, OCR prompts/schema, `getOpenAIClient`.
+  - `functions/lib/invoice-pdf.js` — `convertBufferToPdf`, `buildCombinedPdfFromPages`.
+  - `functions/lib/invoice-processor.js` — `processInvoiceDocumentHandler` (lock, OCR, dedup, supplier upsert, Firestore writes).
+  - `functions/lib/payments.js` — `validatePaymentRequest`, `derivePaymentStatus`, `validateUpdateFieldsRequest`.
+  - `functions/lib/suppliers.js` — `validateUpdateSupplierRequest`, `validateDeliveryObject`, `validateTimeObject`.
+  - `functions/lib/financial.js` — `ENTRY_TYPE`, `EXPENSE_CATEGORY`, `buildFinancialEntry`, `validateFinancialEntryRequest`.
+  - `functions/lib/recurring.js` — `validateRecurringExpenseRequest`.
 - **CLI tools** at the project root:
   - `auth_login.js` — Firebase email/password sign-in, returns ID token.
   - `invoice_ocr.js` / `invoice_ocr_2.js` — Local OCR via GPT-4o.
@@ -56,15 +68,16 @@
 - **Async**: always use `async/await`. No callbacks.
 - **Auth pattern**: `authenticateRequest(req)` returns `{ user }` or `{ error, status }`.
 - **Validation**: dedicated validator function per endpoint (e.g., `validatePaymentRequest`, `validateFinancialEntryRequest`).
-- **Error handling**: `try/catch` blocks; errors thrown with `Object.assign(new Error(...), { httpStatus })`; errors returned as JSON.
+- **Error handling**: `try/catch` blocks; use `sendError(res, status, message, { details?, code? })` from `lib/http-utils.js` for consistent error responses.
+- **HTTP helpers**: use `HTTP_OPTS` for shared `onRequest` options and `requireMethod(req, res, 'POST')` for method checks — both from `lib/http-utils.js`.
 - **Section markers** in `functions/index.js` use banner comments:
   ```
   // ═══════════════════════════════════════════════════════════════════════════════
   // SECTION TITLE
   // ═══════════════════════════════════════════════════════════════════════════════
   ```
-- **No linting config**: ESLint and Prettier are not set up.
-- **No tests**: no test framework is configured.
+- **Linting**: ESLint 9+ (flat config) and Prettier are configured in `functions/`. Run `npm run lint` and `npm run format`.
+- **Testing**: Vitest is configured in `functions/`. Tests live in `functions/test/`. Run `npm test` (single run) or `npm run test:watch` (watch mode). Firebase and cloud service dependencies are mocked in `functions/test/setup.js`.
 - **Greek text** is used in all user-facing strings (error messages, expense categories, field labels).
 
 ## 6. Key Patterns and Gotchas
@@ -88,12 +101,13 @@
 **Do:**
 - Use ESM imports (`import ... from '...'`), never CommonJS `require()`.
 - Authenticate every HTTP function with `authenticateRequest(req)`.
-- Return errors as `{ error: "message" }` JSON with the appropriate HTTP status code.
+- Return errors using `sendError(res, status, message)` from `lib/http-utils.js`.
 - Keep user-facing strings in Greek.
 - Use `defineString` from `firebase-functions/params` for new environment parameters.
 - Follow the `_v2` suffix convention when adding new Cloud Functions.
 - Use the `// ═══` banner comment style when adding new sections to `functions/index.js`.
 - Write a dedicated validator function for any new endpoint.
+- Write unit tests for every new pure helper function, validator, or business-logic function. Place tests in `functions/test/` following the existing `<module>.test.js` naming convention.
 
 **Don't:**
 - Don't use `functions.config()` — it is a Gen 1 API.
