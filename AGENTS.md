@@ -42,6 +42,8 @@
 - **Blue-green deployment**: all functions use a `_v2` suffix during the Gen 1 → Gen 2 migration.
 - **Env config**: `functions/.env` is written by `update-env-default.sh` or `update-env-prod.sh`. Functions use `defineString` params — **not** `functions.config()`.
 - **Deployment is manual** via the Firebase CLI; there is no CI/CD pipeline.
+- **Pre-deploy checks**: `firebase.json` has `predeploy` scripts that run `npm run lint` and `npm test` in `functions/` before every deploy. If either fails, the deploy is aborted.
+- **Pre-commit hook**: `simple-git-hooks` + `lint-staged` are configured in root `package.json`. On every commit that touches `functions/**/*.js`, lint and tests run automatically. If they fail, the commit is blocked.
 - **Emulators** are configured in `firebase.json`:
   - Auth: port 9099
   - Functions: port 5001

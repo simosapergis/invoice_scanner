@@ -2,6 +2,10 @@
   "functions": {
     "source": "functions",
     "runtime": "nodejs22",
+    "predeploy": [
+      "npm --prefix functions run lint",
+      "npm --prefix functions run test"
+    ],
     "ignore": [
       "node_modules",
       ".git",

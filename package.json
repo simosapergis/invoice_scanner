@@ -8,7 +8,17 @@
     "invoice:ocr2": "node invoice_ocr_2.js",
     "auth:login": "node auth_login.js",
     "signed-url:server": "node signed_url_server.js",
-    "upload:invoice": "node upload_invoice.js"
+    "upload:invoice": "node upload_invoice.js",
+    "prepare": "npx simple-git-hooks"
+  },
+  "simple-git-hooks": {
+    "pre-commit": "npx lint-staged"
+  },
+  "lint-staged": {
+    "functions/**/*.js": [
+      "npm run lint --prefix functions",
+      "npm run test --prefix functions"
+    ]
   },
   "engines": {
     "node": ">=22.0.0"
@@ -20,6 +30,10 @@
     "firebase-admin": "^12.1.1",
     "openai": "^4.77.0",
     "pdf-lib": "^1.17.1"
+  },
+  "devDependencies": {
+    "lint-staged": "^15.0.0",
+    "simple-git-hooks": "^2.0.0"
   }
 }
 
