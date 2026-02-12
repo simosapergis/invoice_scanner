@@ -108,6 +108,7 @@
 - Use the `// ═══` banner comment style when adding new sections to `functions/index.js`.
 - Write a dedicated validator function for any new endpoint.
 - Write unit tests for every new pure helper function, validator, or business-logic function. Place tests in `functions/test/` following the existing `<module>.test.js` naming convention.
+- After modifying any file in `functions/`, always run `npm run lint` and `npm test` in the `functions/` directory. Fix any failures before considering the task complete.
 
 **Don't:**
 - Don't use `functions.config()` — it is a Gen 1 API.
