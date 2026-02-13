@@ -154,17 +154,21 @@ async function processInvoiceDocumentHandler(event) {
     console.log('OCR extraction (GR):', JSON.stringify(ocrResult, null, 2));
     console.log('OCR extraction (EN):', JSON.stringify(mappedResult, null, 2));
 
-    supplierName = mappedResult.supplierName || 'Unknown Supplier';
+    const ocrSupplierName = mappedResult.supplierName || 'Unknown Supplier';
+    supplierName = ocrSupplierName;
     const supplierTaxNumber = mappedResult.supplierTaxNumber || null;
     const supplierId = sanitizeId(supplierTaxNumber, sanitizeId(supplierName, 'unknown-supplier'));
     invoiceNumber = mappedResult.invoiceNumber?.toString().match(/\d+/g)?.join('') || null;
     const uploadedBy = invoiceData.ownerUid || null;
-    await ensureSupplierProfile({
+    const { canonicalName } = await ensureSupplierProfile({
       supplierId,
       supplierName,
       supplierTaxNumber,
       supplierCategory: mappedResult.supplierCategory || null,
     });
+    if (canonicalName) {
+      supplierName = canonicalName;
+    }
 
     // Check for duplicate invoice (same supplier + invoice number, only against done invoices)
     if (invoiceNumber && supplierId) {
@@ -219,7 +223,7 @@ async function processInvoiceDocumentHandler(event) {
 
     // Store original OCR data for reference when user edits fields
     const ocrData = {
-      supplierName,
+      supplierName: ocrSupplierName,
       supplierTaxNumber,
       invoiceNumber,
       invoiceDate: mappedResult.invoiceDate || null,

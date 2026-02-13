@@ -5,14 +5,13 @@ const EDITABLE_SUPPLIER_FIELDS = ['name', 'supplierCategory', 'supplierTaxNumber
 async function ensureSupplierProfile({ supplierId, supplierName, supplierTaxNumber, supplierCategory }) {
   if (!supplierId) {
     console.warn('Missing supplierId; skipping supplier profile update.');
-    return;
+    return { canonicalName: undefined };
   }
 
   const supplierRef = db.doc(`suppliers/${supplierId}`);
-  //TODO:if supplier already exists, do not update the profile
 
   try {
-    await db.runTransaction(async (tx) => {
+    const canonicalName = await db.runTransaction(async (tx) => {
       const snap = await tx.get(supplierRef);
       if (!snap.exists) {
         tx.set(supplierRef, {
@@ -22,7 +21,7 @@ async function ensureSupplierProfile({ supplierId, supplierName, supplierTaxNumb
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         });
-        return;
+        return supplierName;
       }
 
       const current = snap.data() || {};
@@ -41,9 +40,14 @@ async function ensureSupplierProfile({ supplierId, supplierName, supplierTaxNumb
         updates.updatedAt = serverTimestamp();
         tx.update(supplierRef, updates);
       }
+
+      return current.name || supplierName;
     });
+
+    return { canonicalName };
   } catch (error) {
     console.error(`Failed to upsert supplier profile for ${supplierId}`, error);
+    return { canonicalName: supplierName };
   }
 }
 

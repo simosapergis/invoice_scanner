@@ -1,9 +1,123 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
+  ensureSupplierProfile,
   validateTimeObject,
   validateDeliveryObject,
   validateUpdateSupplierRequest,
 } from '../lib/suppliers.js';
+import { db } from '../lib/config.js';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ensureSupplierProfile
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe('ensureSupplierProfile', () => {
+  function mockTransaction(snapData) {
+    const txGet = vi.fn().mockResolvedValue({
+      exists: snapData !== null,
+      data: () => snapData,
+    });
+    const txSet = vi.fn();
+    const txUpdate = vi.fn();
+
+    db.doc = vi.fn().mockReturnValue({ path: 'suppliers/test-id' });
+    db.runTransaction = vi.fn(async (cb) =>
+      cb({ get: txGet, set: txSet, update: txUpdate })
+    );
+
+    return { txGet, txSet, txUpdate };
+  }
+
+  it('returns OCR name as canonical when supplier is new', async () => {
+    mockTransaction(null);
+
+    const result = await ensureSupplierProfile({
+      supplierId: 'sup-1',
+      supplierName: 'OCR Name',
+      supplierTaxNumber: '123',
+      supplierCategory: 'food',
+    });
+
+    expect(result).toEqual({ canonicalName: 'OCR Name' });
+  });
+
+  it('returns existing Firestore name as canonical when supplier exists', async () => {
+    mockTransaction({ name: 'Existing Name', supplierCategory: 'food', supplierTaxNumber: '123' });
+
+    const result = await ensureSupplierProfile({
+      supplierId: 'sup-1',
+      supplierName: 'OCR Different Name',
+      supplierTaxNumber: '123',
+      supplierCategory: 'food',
+    });
+
+    expect(result).toEqual({ canonicalName: 'Existing Name' });
+  });
+
+  it('returns OCR name when existing supplier has no name', async () => {
+    mockTransaction({ name: null, supplierCategory: 'food', supplierTaxNumber: '123' });
+
+    const result = await ensureSupplierProfile({
+      supplierId: 'sup-1',
+      supplierName: 'OCR Name',
+      supplierTaxNumber: '123',
+      supplierCategory: null,
+    });
+
+    expect(result).toEqual({ canonicalName: 'OCR Name' });
+  });
+
+  it('returns undefined canonical name when supplierId is missing', async () => {
+    const result = await ensureSupplierProfile({
+      supplierId: '',
+      supplierName: 'Some Name',
+      supplierTaxNumber: null,
+      supplierCategory: null,
+    });
+
+    expect(result).toEqual({ canonicalName: undefined });
+  });
+
+  it('returns null canonical name when new supplier has no name', async () => {
+    mockTransaction(null);
+
+    const result = await ensureSupplierProfile({
+      supplierId: 'sup-1',
+      supplierName: null,
+      supplierTaxNumber: '123',
+      supplierCategory: 'food',
+    });
+
+    expect(result).toEqual({ canonicalName: null });
+  });
+
+  it('returns OCR name when existing supplier has empty string name', async () => {
+    mockTransaction({ name: '', supplierCategory: 'food', supplierTaxNumber: '123' });
+
+    const result = await ensureSupplierProfile({
+      supplierId: 'sup-1',
+      supplierName: 'OCR Name',
+      supplierTaxNumber: '123',
+      supplierCategory: null,
+    });
+
+    expect(result).toEqual({ canonicalName: 'OCR Name' });
+  });
+
+  it('returns OCR name as canonical when transaction fails', async () => {
+    db.doc = vi.fn().mockReturnValue({ path: 'suppliers/test-id' });
+    db.runTransaction = vi.fn().mockRejectedValue(new Error('TX failed'));
+
+    const result = await ensureSupplierProfile({
+      supplierId: 'sup-1',
+      supplierName: 'OCR Name',
+      supplierTaxNumber: '123',
+      supplierCategory: null,
+    });
+
+    expect(result).toEqual({ canonicalName: 'OCR Name' });
+  });
+});
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // validateTimeObject
