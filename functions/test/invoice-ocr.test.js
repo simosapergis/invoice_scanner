@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   normalizeEuropeanDecimals,
   parseAmount,
@@ -7,7 +7,10 @@ import {
   parseJsonFromResponse,
   formatMetadataError,
   formatMetadataSuccess,
+  getOpenAIClient,
+  runInvoiceOcrAttempt,
 } from '../lib/invoice-ocr.js';
+import { getVisionClient } from '../lib/config.js';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // normalizeEuropeanDecimals
@@ -292,5 +295,168 @@ describe('formatMetadataSuccess', () => {
     expect(result).toContain('12345');
     expect(result).toContain('Test Supplier');
     expect(result).toContain('✅');
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// getOpenAIClient
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe('getOpenAIClient', () => {
+  it('returns an OpenAI client instance', () => {
+    const client = getOpenAIClient();
+    expect(client).toBeDefined();
+    expect(client.responses).toBeDefined();
+  });
+
+  it('returns the same instance on repeated calls (singleton)', () => {
+    const a = getOpenAIClient();
+    const b = getOpenAIClient();
+    expect(a).toBe(b);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// runInvoiceOcrAttempt
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe('runInvoiceOcrAttempt', () => {
+  const MOCK_OCR_JSON = JSON.stringify({
+    ΗΜΕΡΟΜΗΝΙΑ: '01/01/2026',
+    'ΑΡΙΘΜΟΣ ΤΙΜΟΛΟΓΙΟΥ': '12345',
+    ΠΡΟΜΗΘΕΥΤΗΣ: 'Test Supplier',
+    'ΑΦΜ ΠΡΟΜΗΘΕΥΤΗ': '123456789',
+    'ΚΑΘΑΡΗ ΑΞΙΑ': '100.00',
+    ΦΠΑ: '24.00',
+    ΠΛΗΡΩΤΕΟ: '124.00',
+    ΑΚΡΙΒΕΙΑ: '90',
+  });
+
+  let visionClient;
+  let openaiClient;
+
+  beforeEach(() => {
+    visionClient = getVisionClient();
+    openaiClient = getOpenAIClient();
+    openaiClient.responses.create = vi.fn().mockResolvedValue({
+      output: [{ content: [{ text: MOCK_OCR_JSON }] }],
+    });
+  });
+
+  it('calls batchAnnotateFiles for PDF pages with GCS URI', async () => {
+    const batchSpy = vi.spyOn(visionClient, 'batchAnnotateFiles').mockResolvedValue([{
+      responses: [{
+        responses: [
+          { fullTextAnnotation: { text: 'Page 1 text from PDF' } },
+        ],
+      }],
+    }]);
+
+    const pages = [{
+      mimeType: 'application/pdf',
+      bucketName: 'test-bucket',
+      objectName: 'uploads/inv-1/invoice.pdf',
+      totalPages: 1,
+      pageNumber: 1,
+    }];
+
+    const result = await runInvoiceOcrAttempt(pages);
+
+    expect(batchSpy).toHaveBeenCalledOnce();
+    const callArg = batchSpy.mock.calls[0][0];
+    expect(callArg.requests[0].inputConfig.gcsSource.uri).toBe('gs://test-bucket/uploads/inv-1/invoice.pdf');
+    expect(callArg.requests[0].inputConfig.mimeType).toBe('application/pdf');
+    expect(result).toBeDefined();
+    expect(result['ΠΡΟΜΗΘΕΥΤΗΣ']).toBe('Test Supplier');
+    batchSpy.mockRestore();
+  });
+
+  it('passes pages [1, N] when totalPages > 2 (first+last optimization)', async () => {
+    const batchSpy = vi.spyOn(visionClient, 'batchAnnotateFiles').mockResolvedValue([{
+      responses: [{
+        responses: [
+          { fullTextAnnotation: { text: 'First page text' } },
+          { fullTextAnnotation: { text: 'Last page text' } },
+        ],
+      }],
+    }]);
+
+    const pages = [{
+      mimeType: 'application/pdf',
+      bucketName: 'test-bucket',
+      objectName: 'uploads/inv-1/invoice.pdf',
+      totalPages: 5,
+      pageNumber: 1,
+    }];
+
+    await runInvoiceOcrAttempt(pages);
+
+    const callArg = batchSpy.mock.calls[0][0];
+    expect(callArg.requests[0].pages).toEqual([1, 5]);
+    batchSpy.mockRestore();
+  });
+
+  it('omits pages param when totalPages <= 2', async () => {
+    const batchSpy = vi.spyOn(visionClient, 'batchAnnotateFiles').mockResolvedValue([{
+      responses: [{
+        responses: [
+          { fullTextAnnotation: { text: 'Page 1' } },
+          { fullTextAnnotation: { text: 'Page 2' } },
+        ],
+      }],
+    }]);
+
+    const pages = [{
+      mimeType: 'application/pdf',
+      bucketName: 'test-bucket',
+      objectName: 'uploads/inv-1/invoice.pdf',
+      totalPages: 2,
+      pageNumber: 1,
+    }];
+
+    await runInvoiceOcrAttempt(pages);
+
+    const callArg = batchSpy.mock.calls[0][0];
+    expect(callArg.requests[0].pages).toBeUndefined();
+    batchSpy.mockRestore();
+  });
+
+  it('throws when PDF Vision response has no text', async () => {
+    vi.spyOn(visionClient, 'batchAnnotateFiles').mockResolvedValue([{
+      responses: [{
+        responses: [
+          { fullTextAnnotation: { text: '' } },
+        ],
+      }],
+    }]);
+
+    const pages = [{
+      mimeType: 'application/pdf',
+      bucketName: 'test-bucket',
+      objectName: 'uploads/inv-1/invoice.pdf',
+      totalPages: 1,
+      pageNumber: 1,
+    }];
+
+    await expect(runInvoiceOcrAttempt(pages)).rejects.toThrow('Vision API did not return any text');
+    vi.restoreAllMocks();
+  });
+
+  it('calls documentTextDetection for image pages', async () => {
+    const docSpy = vi.spyOn(visionClient, 'documentTextDetection').mockResolvedValue([{
+      fullTextAnnotation: { text: 'Image page text' },
+    }]);
+
+    const pages = [{
+      mimeType: 'image/jpeg',
+      buffer: Buffer.from('fake-image'),
+      pageNumber: 1,
+    }];
+
+    const result = await runInvoiceOcrAttempt(pages);
+
+    expect(docSpy).toHaveBeenCalledOnce();
+    expect(result).toBeDefined();
+    docSpy.mockRestore();
   });
 });

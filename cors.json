@@ -1,0 +1,19 @@
+[
+  {
+    "maxAgeSeconds": 3600,
+    "method": ["GET", "PUT", "POST", "HEAD", "OPTIONS", "DELETE"],
+    "origin": [
+      "http://localhost:5173",
+      "https://forbidden-fruit-invoices.web.app",
+      "https://forbidden-fruit-invoices.firebaseapp.com"
+    ],
+    "responseHeader": [
+      "Content-Type",
+      "Authorization",
+      "Content-Length",
+      "x-goog-resumable",
+      "x-goog-meta-*",
+      "Access-Control-Allow-Origin"
+    ]
+  }
+]

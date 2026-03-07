@@ -15,8 +15,9 @@
   "dependencies": {
     "@google-cloud/storage": "^7.11.1",
     "@google-cloud/vision": "^5.3.4",
+    "archiver": "^7.0.1",
     "firebase-admin": "^12.1.1",
-    "firebase-functions": "^7.0.5",
+    "firebase-functions": "^7.0.6",
     "openai": "^4.77.0",
     "pdf-lib": "^1.17.1"
   },

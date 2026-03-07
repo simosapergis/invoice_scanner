@@ -88,7 +88,7 @@ function validateFinancialEntryRequest(body) {
 /**
  * Creates a financial entry document
  */
-function buildFinancialEntry({ type, category, amount, date, description, source, metadata, userId }) {
+function buildFinancialEntry({ type, category, amount, date, description, source, metadata, userId, userName }) {
   return {
     type,
     category,
@@ -99,6 +99,7 @@ function buildFinancialEntry({ type, category, amount, date, description, source
     metadata: metadata || {},
     isDeleted: false,
     createdBy: userId,
+    createdByName: userName || null,
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
   };

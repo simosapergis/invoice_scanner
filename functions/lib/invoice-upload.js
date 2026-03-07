@@ -47,7 +47,7 @@ function padPageNumber(pageNumber) {
   return String(pageNumber).padStart(3, '0');
 }
 
-async function ensureInvoiceDocument({ invoiceId, uid, bucketName, totalPages }) {
+async function ensureInvoiceDocument({ invoiceId, uid, userName, bucketName, totalPages }) {
   const resolvedInvoiceId = normalizeInvoiceId(invoiceId);
   const normalizedTotalPages = normalizeTotalPages(totalPages);
   const docRef = invoiceDocRef(resolvedInvoiceId);
@@ -62,6 +62,7 @@ async function ensureInvoiceDocument({ invoiceId, uid, bucketName, totalPages })
       tx.set(docRef, {
         invoiceId: resolvedInvoiceId,
         ownerUid: uid,
+        ownerName: userName || null,
         bucket: bucketName,
         storageFolder: `${UPLOADS_PREFIX}${resolvedInvoiceId}`,
         status: INVOICE_STATUS.pending,
@@ -91,6 +92,7 @@ async function ensureInvoiceDocument({ invoiceId, uid, bucketName, totalPages })
       totalPages: existing.totalPages || normalizedTotalPages || null,
       bucket: existing.bucket || bucketName,
       ownerUid: existing.ownerUid || uid,
+      ownerName: existing.ownerName || userName || null,
       updatedAt: serverTimestamp(),
     });
 

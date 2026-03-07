@@ -152,6 +152,7 @@ describe('buildFinancialEntry', () => {
       description: 'Holiday sales',
       source: ENTRY_SOURCE.manual,
       userId: 'user-123',
+      userName: 'Simos',
     });
 
     expect(entry.type).toBe('income');
@@ -161,6 +162,20 @@ describe('buildFinancialEntry', () => {
     expect(entry.source).toBe('manual');
     expect(entry.isDeleted).toBe(false);
     expect(entry.createdBy).toBe('user-123');
+    expect(entry.createdByName).toBe('Simos');
+  });
+
+  it('sets createdByName to null when userName is not provided', () => {
+    const entry = buildFinancialEntry({
+      type: 'expense',
+      category: EXPENSE_CATEGORY.rent,
+      amount: 800,
+      date: '2024-01-01',
+      userId: 'user-1',
+    });
+
+    expect(entry.createdBy).toBe('user-1');
+    expect(entry.createdByName).toBeNull();
   });
 
   it('converts date string to Timestamp', () => {

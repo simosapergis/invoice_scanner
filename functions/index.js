@@ -23,7 +23,7 @@ import {
   getBucketName,
 } from './lib/config.js';
 
-import { authenticateRequest } from './lib/auth.js';
+import { authenticateRequest, getUserDisplayName } from './lib/auth.js';
 import { HTTP_OPTS, requireMethod, sendError } from './lib/http-utils.js';
 
 import {
@@ -53,6 +53,14 @@ import {
 } from './lib/financial.js';
 
 import { validateRecurringExpenseRequest } from './lib/recurring.js';
+
+import {
+  validateExportRequest,
+  fetchInvoiceDocuments,
+  recordDownloads,
+  streamInvoicesZip,
+  getExportDownloadUrl,
+} from './lib/invoice-export.js';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SIGNED UPLOAD URL
@@ -93,6 +101,7 @@ export const getSignedUploadUrl_v2 = onRequest(HTTP_OPTS, async (req, res) => {
     const invoiceMetadata = await ensureInvoiceDocument({
       invoiceId,
       uid: decoded.uid,
+      userName: getUserDisplayName(decoded),
       bucketName,
       totalPages: normalizedTotalPages,
     });
@@ -302,6 +311,7 @@ export const updatePaymentStatus_v2 = onRequest(HTTP_OPTS, async (req, res) => {
         notes: notes || null,
         recordedAt: admin.firestore.Timestamp.now(),
         recordedBy: user.uid,
+        recordedByName: getUserDisplayName(user),
       };
 
       // 11. Update invoice document
@@ -348,6 +358,7 @@ export const updatePaymentStatus_v2 = onRequest(HTTP_OPTS, async (req, res) => {
         },
         isDeleted: false,
         createdBy: user.uid,
+        createdByName: getUserDisplayName(user),
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       };
@@ -444,6 +455,7 @@ export const updateInvoiceFields_v2 = onRequest(HTTP_OPTS, async (req, res) => {
       const updates = {
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         lastEditedBy: user.uid,
+        lastEditedByName: getUserDisplayName(user),
         lastEditedAt: admin.firestore.FieldValue.serverTimestamp(),
       };
 
@@ -615,6 +627,7 @@ export const updateSupplierFields_v2 = onRequest(HTTP_OPTS, async (req, res) => 
       const updates = {
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         lastEditedBy: user.uid,
+        lastEditedByName: getUserDisplayName(user),
         lastEditedAt: admin.firestore.FieldValue.serverTimestamp(),
       };
 
@@ -791,6 +804,7 @@ export const addFinancialEntry_v2 = onRequest(HTTP_OPTS, async (req, res) => {
       description: body.description,
       source: ENTRY_SOURCE.manual,
       userId: user.uid,
+      userName: getUserDisplayName(user),
     });
 
     const docRef = await db.collection(FINANCIAL_ENTRIES_COLLECTION).add(entry);
@@ -851,6 +865,7 @@ export const deleteFinancialEntry_v2 = onRequest(HTTP_OPTS, async (req, res) => 
     await entryRef.update({
       isDeleted: true,
       deletedBy: user.uid,
+      deletedByName: getUserDisplayName(user),
       deletedAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
     });
@@ -1015,6 +1030,7 @@ export const addRecurringExpense_v2 = onRequest(HTTP_OPTS, async (req, res) => {
       description: body.description || null,
       isActive: true,
       createdBy: user.uid,
+      createdByName: getUserDisplayName(user),
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
     };
@@ -1109,6 +1125,7 @@ export const updateRecurringExpense_v2 = onRequest(HTTP_OPTS, async (req, res) =
     const updates = {
       updatedAt: serverTimestamp(),
       lastEditedBy: user.uid,
+      lastEditedByName: getUserDisplayName(user),
     };
 
     if (fields.amount !== undefined) updates.amount = fields.amount;
@@ -1184,6 +1201,7 @@ export const processRecurringExpenses_v2 = onSchedule(
           },
           isDeleted: false,
           createdBy: recurring.createdBy,
+          createdByName: recurring.createdByName || null,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         };
@@ -1239,5 +1257,139 @@ export const getRecurringExpenses_v2 = onRequest(HTTP_OPTS, async (req, res) => 
   } catch (error) {
     console.error('Failed to get recurring expenses:', error);
     return sendError(res, 500, 'Failed to get recurring expenses', { details: error.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXPORT INVOICES (ZIP Download)
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Accepts a list of selected invoices (by supplierId + invoiceId), fetches
+// their PDFs from GCS, streams them into a ZIP archive, uploads the ZIP to a
+// temporary GCS path, records a download event on each invoice, and returns
+// a signed download URL.
+//
+// The date-range listing and supplier grouping happens entirely on the client
+// via the Firestore SDK. This function only handles the selected downloads.
+//
+// Request Body:
+// {
+//   invoices: [                          // Required - selected invoices
+//     { supplierId: string, invoiceId: string },
+//     ...
+//   ]
+// }
+//
+// Response:
+// {
+//   success: true,
+//   message: string,
+//   data: {
+//     downloadUrl: string,
+//     invoiceCount: number,
+//     zipPath: string,
+//     expiresAt: string
+//   }
+// }
+//
+// Download tracking:
+// - After a successful export, each invoice document receives a
+//   `downloadedBy.<uid>` map entry with `lastDownloadedAt` and
+//   `downloadCount` so the client UI can show "already downloaded" badges.
+//
+// Security:
+// - Requires Firebase Authentication
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const EXPORT_OPTS = {
+  ...HTTP_OPTS,
+  timeoutSeconds: 540,
+  memory: '1GiB',
+};
+
+// Blue-green deployment: v2 functions run alongside v1
+// Old function name: exportInvoices
+export const exportInvoices_v2 = onRequest(EXPORT_OPTS, async (req, res) => {
+  if (!requireMethod(req, res, 'POST')) return;
+
+  // 1. Authenticate
+  const authResult = await authenticateRequest(req);
+  if (authResult.error) {
+    return sendError(res, authResult.status, authResult.error);
+  }
+  const user = authResult.user;
+
+  // 2. Validate request body
+  const body = req.body || {};
+  const validationErrors = validateExportRequest(body);
+  if (validationErrors.length > 0) {
+    return sendError(res, 400, 'Validation failed', { details: validationErrors });
+  }
+
+  const { invoices: invoicePairs } = body;
+
+  try {
+    // 3. Fetch invoice documents by direct path
+    const invoices = await fetchInvoiceDocuments(invoicePairs);
+
+    if (invoices.length === 0) {
+      return res.status(200).json({
+        success: true,
+        message: 'Δεν βρέθηκαν τιμολόγια για τα επιλεγμένα αναγνωριστικά',
+        data: { invoiceCount: 0 },
+      });
+    }
+
+    // 4. Filter to invoices that have a PDF file
+    const exportable = invoices.filter((inv) => inv.filePath);
+    if (exportable.length === 0) {
+      return res.status(200).json({
+        success: true,
+        message: 'Δεν βρέθηκαν αρχεία PDF για τα επιλεγμένα τιμολόγια',
+        data: { invoiceCount: invoices.length },
+      });
+    }
+
+    console.log(`Exporting ${exportable.length} invoices for user ${user.uid}`);
+
+    // 5. Stream PDFs into a ZIP and upload to GCS
+    const zipPath = await streamInvoicesZip({
+      invoices: exportable,
+      uid: user.uid,
+    });
+
+    // 6. Record download event on each exported invoice
+    const exportedPairs = exportable.map(({ supplierId, invoiceId }) => ({
+      supplierId,
+      invoiceId,
+    }));
+    try {
+      await recordDownloads({ invoicePairs: exportedPairs, uid: user.uid, userName: getUserDisplayName(user) });
+    } catch (trackingError) {
+      // Log but don't fail the export — download tracking is secondary
+      console.error('Failed to record download tracking:', trackingError);
+    }
+
+    // 7. Generate signed download URL
+    const { downloadUrl, expiresAt } = await getExportDownloadUrl(zipPath);
+
+    console.log(`Export complete: ${exportable.length} invoices → ${zipPath}`);
+
+    return res.status(200).json({
+      success: true,
+      message: `Εξαγωγή ${exportable.length} τιμολογίων ολοκληρώθηκε`,
+      data: {
+        downloadUrl,
+        invoiceCount: exportable.length,
+        zipPath,
+        expiresAt,
+      },
+    });
+  } catch (error) {
+    console.error('Invoice export failed:', error);
+    return sendError(res, 500, 'Αποτυχία εξαγωγής τιμολογίων', {
+      details: error.message,
+      code: 'EXPORT_ERROR',
+    });
   }
 });

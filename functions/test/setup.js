@@ -56,6 +56,9 @@ vi.mock('@google-cloud/vision', () => ({
       documentTextDetection() {
         return Promise.resolve([{}]);
       }
+      batchAnnotateFiles() {
+        return Promise.resolve([{ responses: [{ responses: [] }] }]);
+      }
     },
   },
 }));

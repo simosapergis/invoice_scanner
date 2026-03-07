@@ -4,6 +4,7 @@ const HTTP_OPTS = {
   region: REGION,
   serviceAccount: SERVICE_ACCOUNT_EMAIL,
   cors: true,
+  invoker: 'public',
   timeoutSeconds: 60,
   memory: '256MiB',
 };

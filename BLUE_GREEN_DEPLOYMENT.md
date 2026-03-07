@@ -43,8 +43,8 @@ https://{region}-{project-id}.cloudfunctions.net/{functionName}_v2
 ```
 
 For example:
-- Old: `https://europe-west6-clean-abacus-482115-a1.cloudfunctions.net/updatePaymentStatus`
-- New: `https://europe-west6-clean-abacus-482115-a1.cloudfunctions.net/updatePaymentStatus_v2`
+- Old: `https://europe-west3-clean-abacus-482115-a1.cloudfunctions.net/updatePaymentStatus`
+- New: `https://europe-west3-clean-abacus-482115-a1.cloudfunctions.net/updatePaymentStatus_v2`
 
 **Testing checklist:**
 - [ ] Test `getSignedUploadUrl_v2` - Upload invoice PDF
@@ -68,17 +68,17 @@ Update your frontend/client to use the new v2 function URLs. Update all function
 
 ```javascript
 // Before
-const functionUrl = 'https://europe-west6-clean-abacus-482115-a1.cloudfunctions.net/updatePaymentStatus';
+const functionUrl = 'https://europe-west3-clean-abacus-482115-a1.cloudfunctions.net/updatePaymentStatus';
 
 // After
-const functionUrl = 'https://europe-west6-clean-abacus-482115-a1.cloudfunctions.net/updatePaymentStatus_v2';
+const functionUrl = 'https://europe-west3-clean-abacus-482115-a1.cloudfunctions.net/updatePaymentStatus_v2';
 ```
 
 Or better yet, use a config/environment variable:
 
 ```javascript
 const FUNCTION_VERSION = process.env.REACT_APP_FUNCTION_VERSION || '_v2';
-const functionUrl = `https://europe-west6-clean-abacus-482115-a1.cloudfunctions.net/updatePaymentStatus${FUNCTION_VERSION}`;
+const functionUrl = `https://europe-west3-clean-abacus-482115-a1.cloudfunctions.net/updatePaymentStatus${FUNCTION_VERSION}`;
 ```
 
 ### Step 4: Monitor & Verify
@@ -168,7 +168,7 @@ Ensure your `functions/.env` file contains:
 
 ```env
 SERVICE_ACCOUNT_EMAIL=firebase-adminsdk-fbsvc@clean-abacus-482115-a1.iam.gserviceaccount.com
-REGION=europe-west6
+REGION=europe-west3
 OPENAI_API_KEY=sk-proj-...
 GCS_BUCKET=clean-abacus-482115-a1.appspot.com
 ```

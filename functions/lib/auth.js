@@ -23,4 +23,8 @@ async function authenticateRequest(req) {
   }
 }
 
-export { extractBearerToken, authenticateRequest };
+function getUserDisplayName(decodedToken) {
+  return decodedToken.name || decodedToken.email || decodedToken.uid;
+}
+
+export { extractBearerToken, authenticateRequest, getUserDisplayName };

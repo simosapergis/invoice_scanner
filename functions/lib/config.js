@@ -6,12 +6,20 @@ import { defineString } from 'firebase-functions/params';
 admin.initializeApp();
 
 const storage = new Storage();
-const visionClient = new vision.ImageAnnotatorClient();
 const db = admin.firestore();
+
+// Lazy-initialize Vision client — only processInvoiceDocument_v2 uses it
+let _visionClient = null;
+function getVisionClient() {
+  if (!_visionClient) {
+    _visionClient = new vision.ImageAnnotatorClient();
+  }
+  return _visionClient;
+}
 
 // Define environment parameters (type-safe, validated at deploy time)
 const SERVICE_ACCOUNT_EMAIL = defineString('SERVICE_ACCOUNT_EMAIL');
-const REGION = defineString('REGION', { default: 'europe-west6' });
+const REGION = defineString('REGION', { default: 'europe-west3' });
 const OPENAI_API_KEY = defineString('OPENAI_API_KEY');
 const GCS_BUCKET = defineString('GCS_BUCKET');
 
@@ -43,7 +51,7 @@ export {
   admin,
   db,
   storage,
-  visionClient,
+  getVisionClient,
   SERVICE_ACCOUNT_EMAIL,
   REGION,
   OPENAI_API_KEY,

@@ -4,8 +4,7 @@
   "description": "CLI tool that uses GPT-4o to extract Greek invoice fields via OCR.",
   "type": "module",
   "scripts": {
-    "invoice:ocr": "node invoice_ocr.js",
-    "invoice:ocr2": "node invoice_ocr_2.js",
+    "setup:client": "bash scripts/setup_new_client.sh",
     "auth:login": "node auth_login.js",
     "signed-url:server": "node signed_url_server.js",
     "upload:invoice": "node upload_invoice.js",
@@ -17,7 +16,7 @@
   "lint-staged": {
     "functions/**/*.js": [
       "npm run lint --prefix functions",
-      "npm run test --prefix functions"
+      "bash -c 'npm run test --prefix functions'"
     ]
   },
   "engines": {

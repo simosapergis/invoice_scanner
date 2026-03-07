@@ -119,25 +119,27 @@ async function processInvoiceDocumentHandler(event) {
   let supplierName = null;
   let invoiceNumber = null;
 
-  try {
-    const { combinedPdfBuffer, downloadedPages } = await buildCombinedPdfFromPages(pages, bucketName);
+  const isSinglePdf = pages.length === 1 && pages[0].contentType === 'application/pdf';
 
-    // At this stage of the app, in order to avoid noise and extra charges from the Vision API
-    // and GPT, we will only OCR the first and last page of the invoice
-    // since the supplier info, invoice number, date are on the first page
-    // and the totals, amounts are on the last page. (MVP)
-    // For invoices with more than 2 pages, OCR only first and last page
-    // Page 1 = supplier info, invoice number, date
-    // Page N = totals, amounts
-    let pagesToOcr = downloadedPages;
-    if (downloadedPages.length > 2) {
-      const sortedPages = [...downloadedPages].sort((a, b) => a.pageNumber - b.pageNumber);
-      const firstPage = sortedPages[0];
-      const lastPage = sortedPages[sortedPages.length - 1];
-      pagesToOcr = [firstPage, lastPage];
-      console.log(
-        `Invoice has ${downloadedPages.length} pages; OCR will process only page ${firstPage.pageNumber} and page ${lastPage.pageNumber}`
-      );
+  try {
+    let pagesToOcr;
+    let combinedPdfBuffer;
+
+    if (isSinglePdf) {
+      // PDF path: Vision reads directly from GCS, no download needed for OCR
+      const pdfPage = pages[0];
+      pagesToOcr = [{
+        mimeType: 'application/pdf',
+        bucketName: pdfPage.bucket || bucketName,
+        objectName: pdfPage.objectName,
+        totalPages: invoiceData.totalPages || null,
+        pageNumber: 1,
+      }];
+    } else {
+      // Image path: download all pages, combine into a single PDF
+      const result = await buildCombinedPdfFromPages(pages, bucketName);
+      combinedPdfBuffer = result.combinedPdfBuffer;
+      pagesToOcr = result.downloadedPages;
     }
 
     const ocrResult = await runInvoiceOcr(pagesToOcr);
@@ -160,6 +162,7 @@ async function processInvoiceDocumentHandler(event) {
     const supplierId = sanitizeId(supplierTaxNumber, sanitizeId(supplierName, 'unknown-supplier'));
     invoiceNumber = mappedResult.invoiceNumber?.toString().match(/\d+/g)?.join('') || null;
     const uploadedBy = invoiceData.ownerUid || null;
+    const uploadedByName = invoiceData.ownerName || null;
     const { canonicalName } = await ensureSupplierProfile({
       supplierId,
       supplierName,
@@ -203,17 +206,24 @@ async function processInvoiceDocumentHandler(event) {
 
     const pdfObjectPath = `suppliers/${supplierId}/invoices/${invoiceId}.pdf`;
     try {
-      await storage
-        .bucket(bucketName)
-        .file(pdfObjectPath)
-        .save(combinedPdfBuffer, {
-          resumable: false,
-          contentType: 'application/pdf',
-          metadata: {
-            pages: pages.length,
-            originalFolder: invoiceData.storageFolder || `${UPLOADS_PREFIX}${invoiceId}`,
-          },
-        });
+      if (isSinglePdf) {
+        // Server-side copy: no download/upload, no memory usage
+        const sourceFile = storage.bucket(bucketName).file(pages[0].objectName);
+        const destFile = storage.bucket(bucketName).file(pdfObjectPath);
+        await sourceFile.copy(destFile);
+      } else {
+        await storage
+          .bucket(bucketName)
+          .file(pdfObjectPath)
+          .save(combinedPdfBuffer, {
+            resumable: false,
+            contentType: 'application/pdf',
+            metadata: {
+              pages: pages.length,
+              originalFolder: invoiceData.storageFolder || `${UPLOADS_PREFIX}${invoiceId}`,
+            },
+          });
+      }
       console.log(`Stored normalized PDF at gs://${bucketName}/${pdfObjectPath}`);
     } catch (pdfError) {
       console.error(`Failed to store combined PDF for invoice ${invoiceId}:`, pdfError);
@@ -243,6 +253,7 @@ async function processInvoiceDocumentHandler(event) {
       filePath: pdfObjectPath,
       bucket: bucketName,
       uploadedBy,
+      uploadedByName,
       supplierId,
       supplierName,
       supplierTaxNumber,

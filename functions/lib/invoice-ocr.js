@@ -1,5 +1,5 @@
 import OpenAI from 'openai';
-import { admin, visionClient, OPENAI_API_KEY } from './config.js';
+import { admin, getVisionClient, OPENAI_API_KEY } from './config.js';
 
 const REQUIRED_FIELDS = [
   'ΗΜΕΡΟΜΗΝΙΑ',
@@ -148,10 +148,22 @@ async function runInvoiceOcr(pageBuffers) {
     return null;
   }
 
+  // First+last page optimization for image uploads (>2 pages).
+  // PDF uploads handle this via the Vision API `pages` parameter in runInvoiceOcrAttempt.
+  let effectivePages = pageBuffers;
+  const isImageUpload = pageBuffers.length > 0 && pageBuffers[0].mimeType !== 'application/pdf';
+  if (isImageUpload && pageBuffers.length > 2) {
+    const sorted = [...pageBuffers].sort((a, b) => a.pageNumber - b.pageNumber);
+    effectivePages = [sorted[0], sorted[sorted.length - 1]];
+    console.log(
+      `Invoice has ${pageBuffers.length} pages; OCR will process only page ${effectivePages[0].pageNumber} and page ${effectivePages[1].pageNumber}`
+    );
+  }
+
   let lastError = null;
   for (let attempt = 1; attempt <= OCR_MAX_RETRIES; attempt++) {
     try {
-      const result = await runInvoiceOcrAttempt(pageBuffers);
+      const result = await runInvoiceOcrAttempt(effectivePages);
       if (result) {
         if (attempt > 1) {
           console.log(`OCR succeeded on retry attempt ${attempt}.`);
@@ -174,13 +186,44 @@ async function runInvoiceOcrAttempt(pageBuffers) {
   const aggregatedText = [];
   for (const page of pageBuffers) {
     const mimeType = page.mimeType || 'application/octet-stream';
+
     if (mimeType === 'application/pdf') {
-      console.warn(`Skipping PDF page ${page.pageNumber} for Vision OCR; expected image formats.`, { mimeType });
+      try {
+        const gcsUri = `gs://${page.bucketName}/${page.objectName}`;
+        const totalPages = page.totalPages || 0;
+        const pagesToRequest = totalPages > 2 ? [1, totalPages] : undefined;
+        if (pagesToRequest) {
+          console.log(`PDF has ${totalPages} pages; OCR will process only pages ${pagesToRequest.join(', ')}`);
+        }
+        const [result] = await getVisionClient().batchAnnotateFiles({
+          requests: [{
+            inputConfig: {
+              gcsSource: { uri: gcsUri },
+              mimeType: 'application/pdf',
+            },
+            features: [{ type: 'DOCUMENT_TEXT_DETECTION' }],
+            ...(pagesToRequest && { pages: pagesToRequest }),
+          }],
+        });
+        const pdfResponses = result.responses?.[0]?.responses || [];
+        for (let i = 0; i < pdfResponses.length; i++) {
+          const pageText = pdfResponses[i]?.fullTextAnnotation?.text?.trim();
+          const pageNum = pagesToRequest ? pagesToRequest[i] : i + 1;
+          if (pageText) {
+            aggregatedText.push(`=== PAGE ${pageNum} ===\n${pageText}`);
+          } else {
+            console.warn(`Vision returned empty text for PDF page ${pageNum}`);
+          }
+        }
+      } catch (visionError) {
+        console.error('Vision API batchAnnotateFiles failed for PDF', visionError);
+        throw visionError;
+      }
       continue;
     }
 
     try {
-      const [visionResult] = await visionClient.documentTextDetection({
+      const [visionResult] = await getVisionClient().documentTextDetection({
         image: { content: page.buffer },
       });
       const pageText = visionResult?.fullTextAnnotation?.text?.trim();
