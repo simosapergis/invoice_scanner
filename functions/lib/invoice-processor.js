@@ -156,10 +156,16 @@ async function processInvoiceDocumentHandler(event) {
     console.log('OCR extraction (GR):', JSON.stringify(ocrResult, null, 2));
     console.log('OCR extraction (EN):', JSON.stringify(mappedResult, null, 2));
 
-    const ocrSupplierName = mappedResult.supplierName || 'Unknown Supplier';
-    supplierName = ocrSupplierName;
-    const supplierTaxNumber = mappedResult.supplierTaxNumber || null;
-    const supplierId = sanitizeId(supplierTaxNumber, sanitizeId(supplierName, 'unknown-supplier'));
+    const ocrSupplierName = mappedResult.supplierName || null;
+    const supplierTaxNumber = mappedResult.supplierTaxNumber || ocrSupplierName;
+
+    if (!supplierTaxNumber && !ocrSupplierName) {
+      throw new Error('Δεν ήταν δυνατή η αναγνώριση του προμηθευτή (δεν βρέθηκε ΑΦΜ ή επωνυμία).');
+    }
+
+    supplierName = ocrSupplierName || 'Unknown Supplier';
+    const supplierId = sanitizeId(supplierTaxNumber, sanitizeId(ocrSupplierName, 'unknown-supplier'));
+    const missingTaxNumber = !mappedResult.supplierTaxNumber;
     invoiceNumber = mappedResult.invoiceNumber?.toString().match(/\d+/g)?.join('') || null;
     const uploadedBy = invoiceData.ownerUid || null;
     const uploadedByName = invoiceData.ownerName || null;
@@ -168,6 +174,7 @@ async function processInvoiceDocumentHandler(event) {
       supplierName,
       supplierTaxNumber,
       supplierCategory: mappedResult.supplierCategory || null,
+      missingTaxNumber,
     });
     if (canonicalName) {
       supplierName = canonicalName;
@@ -257,6 +264,7 @@ async function processInvoiceDocumentHandler(event) {
       supplierId,
       supplierName,
       supplierTaxNumber,
+      missingTaxNumber,
       invoiceNumber,
       invoiceDate: parseDate(mappedResult.invoiceDate),
       dueDate: parseDate(mappedResult.dueDate),

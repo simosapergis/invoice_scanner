@@ -127,3 +127,5 @@ Think like a **Principal GCP Architect**. Evaluate every decision through GCP-na
 - Modify `update-env-*.sh` (secrets context).
 - Commit `.env` files or API keys.
 - `Co-authored-by` or other trailers in commit messages.
+
+**When solving any problem, think always step by step and better be sure with your solution**

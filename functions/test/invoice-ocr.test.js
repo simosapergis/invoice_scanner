@@ -157,6 +157,24 @@ describe('parseDate', () => {
   it('returns null for invalid date string', () => {
     expect(parseDate('not-a-date')).toBeNull();
   });
+
+  it('parses dd-MMM-yyyy format via fallback (05-Jan-2026)', () => {
+    const result = parseDate('05-Jan-2026');
+    expect(result).not.toBeNull();
+    expect(result.toDate().toISOString()).toBe('2026-01-05T00:00:00.000Z');
+  });
+
+  it('parses MMM dd, yyyy format via fallback (Jan 05, 2026)', () => {
+    const result = parseDate('Jan 05, 2026');
+    expect(result).not.toBeNull();
+    expect(result.toDate().toISOString()).toBe('2026-01-05T00:00:00.000Z');
+  });
+
+  it('parses full month name format via fallback (January 5, 2026)', () => {
+    const result = parseDate('January 5, 2026');
+    expect(result).not.toBeNull();
+    expect(result.toDate().toISOString()).toBe('2026-01-05T00:00:00.000Z');
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════

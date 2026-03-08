@@ -130,10 +130,11 @@ function parseDate(value) {
     }
   }
 
-  // Fallback for other formats
+  // Fallback for other formats (e.g. "05-Jan-2026", "January 5, 2026")
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return null;
-  return admin.firestore.Timestamp.fromDate(date);
+  const utcDate = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+  return admin.firestore.Timestamp.fromDate(utcDate);
 }
 
 async function runInvoiceOcr(pageBuffers) {
@@ -247,10 +248,10 @@ async function runInvoiceOcrAttempt(pageBuffers) {
   const fullText = normalizeEuropeanDecimals(ocrText);
 
   const systemPrompt = [
-    'You are an expert accountant and document-analysis specialist for Greek invoices.',
+    'You are an expert accountant and document-analysis specialist for invoices (primarily Greek, occasionally foreign).',
     'You ALWAYS output strictly valid JSON following the schema provided by the user.',
     '',
-    'You will be given the FULL multi-page OCR text of a Greek invoice.',
+    'You will be given the FULL multi-page OCR text of an invoice.',
     'The OCR may be noisy, misordered, or contain junk text from headers, footers, or page numbers.',
     'The OCR you receive contains multiple pages in the format',
     '=== PAGE 1 ===',
@@ -259,6 +260,17 @@ async function runInvoiceOcrAttempt(pageBuffers) {
     '... page 2 text ...',
     '=== PAGE N ===',
     '... page N text ...',
+    '',
+    '===========================',
+    'STEP 0: INVOICE ORIGIN DETECTION',
+    '===========================',
+    'Before applying extraction rules, determine the invoice origin:',
+    '- GREEK INVOICE: text is primarily in Greek, OR contains ΑΦΜ/Α.Φ.Μ., ΔΟΥ, or sections like "ΣΤΟΙΧΕΙΑ ΠΕΛΑΤΗ".',
+    '  → Apply rules 3–9 below (GREEK INVOICE RULES).',
+    '- FOREIGN INVOICE: text is primarily in English or another non-Greek language, uses headers like',
+    '  "FROM" / "BILL TO" / "SOLD TO", and lacks Greek tax markers.',
+    '  → Apply the FOREIGN INVOICE OVERRIDES section instead of rules 3–4.',
+    '  → Rules 5–9 still apply with the label adaptations noted in the overrides.',
     '',
     '===========================',
     'GENERAL EXTRACTION RULES',
@@ -348,6 +360,36 @@ async function runInvoiceOcrAttempt(pageBuffers) {
     '- < 60 = large uncertainty',
     '',
     '===========================',
+    'FOREIGN INVOICE OVERRIDES',
+    '===========================',
+    'Apply ONLY when Step 0 classifies the invoice as FOREIGN.',
+    '',
+    'F1. Supplier (ΠΡΟΜΗΘΕΥΤΗΣ):',
+    '   - The supplier is the ISSUING company, typically in the "FROM" section or the header logo/brand at the top.',
+    '   - "BILL TO", "SOLD TO", and "SHIP TO" sections contain the CUSTOMER — never the supplier.',
+    '   - The supplier name is the company name in the FROM block (e.g., "MINDBODY, Inc.").',
+    '',
+    'F2. Supplier VAT Number/TAX ID (ΑΦΜ ΠΡΟΜΗΘΕΥΤΗ):',
+    '   - Foreign suppliers do not have a Greek ΑΦΜ (9-digit numeric).',
+    '   - Look for a VAT number instead (e.g., "VAT number", "VAT ID", "Tax ID", "VAT Reg No").',
+    '   - Foreign VAT numbers are ALPHANUMERIC with a country prefix (e.g., IE3668997OH, DE123456789).',
+    '   - If a VAT number is found, return it as-is in ΑΦΜ ΠΡΟΜΗΘΕΥΤΗ.',
+    '   - If no VAT number is available, return null.',
+    '',
+    'F3. Invoice Number:',
+    '   - Look for "Invoice number", "Invoice #", "Invoice No.", "Inv No" near the top of page 1.',
+    '',
+    'F4. Date:',
+    '   - May appear as dd-MMM-yyyy (e.g., 05-Jan-2026), mm/dd/yyyy, or other formats.',
+    '   - Always output as dd/mm/yyyy.',
+    '',
+    'F5. Financial amounts:',
+    '   - Net Amount: labeled "Subtotal", "Net Total", or "Sub-total".',
+    '   - VAT/Tax: labeled "Tax", "VAT", or "Sales Tax".',
+    '   - Payable: labeled "Total", "Invoice Total", "Amount Due", or "Total Due".',
+    '   - If "Amount Paid" equals the total and "Balance Due" is 0, the payable is the "Invoice Total" or "Amount Paid".',
+    '',
+    '===========================',
     'REASONING',
     '===========================',
     'Think step-by-step INTERNALLY.',
@@ -368,6 +410,7 @@ async function runInvoiceOcrAttempt(pageBuffers) {
     '- Ο προμηθευτής βρίσκεται μόνο στην πρώτη σελίδα, στην κορυφή της σελίδας.\n' +
     '- ΠΡΟΣΟΧΗ: Αγνόησε ονόματα εταιρειών ERP/λογισμικού (π.χ. Epsilon Net, SoftOne, Galaxy, Entersoft) - αυτές ΔΕΝ είναι ο προμηθευτής.\n' +
     '- Ο ΠΡΑΓΜΑΤΙΚΟΣ προμηθευτής έχει δικό του ΑΦΜ, ΔΟΥ και διεύθυνση - όχι απλώς URL ιστοσελίδας.\n' +
+    '- Αν το τιμολόγιο είναι ξενόγλωσσο (π.χ. αγγλικά), αναγνώρισε τον προμηθευτή από το "FROM" section. Για ΑΦΜ, ψάξε για VAT number (αλφαριθμητικό, π.χ. IE3668997OH) — αν δεν υπάρχει, βάλε null.\n' +
     '- Τα οικονομικά σύνολα βρίσκονται μόνο στην τελευταία σελίδα.\n' +
     '- Αν κάποιο πεδίο δεν είναι βέβαιο, βάλε null.\n' +
     '- Χρησιμοποίησε δεκαδικό με τελεία.\n\n' +
@@ -389,7 +432,7 @@ async function runInvoiceOcrAttempt(pageBuffers) {
     text: {
       format: {
         type: 'json_schema',
-        name: 'greek_invoice_ocr_format',
+        name: 'invoice_ocr_format',
         schema: {
           type: 'object',
           additionalProperties: false,

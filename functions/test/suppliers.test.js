@@ -104,6 +104,76 @@ describe('ensureSupplierProfile', () => {
     expect(result).toEqual({ canonicalName: 'OCR Name' });
   });
 
+  it('stores missingTaxNumber flag when creating a new supplier', async () => {
+    const { txSet } = mockTransaction(null);
+
+    await ensureSupplierProfile({
+      supplierId: 'acme-corp',
+      supplierName: 'ACME Corp',
+      supplierTaxNumber: null,
+      supplierCategory: 'food',
+      missingTaxNumber: true,
+    });
+
+    const setPayload = txSet.mock.calls[0][1];
+    expect(setPayload.missingTaxNumber).toBe(true);
+    expect(setPayload.name).toBe('ACME Corp');
+    expect(setPayload.supplierTaxNumber).toBeNull();
+  });
+
+  it('does not set missingTaxNumber flag when VAT is present', async () => {
+    const { txSet } = mockTransaction(null);
+
+    await ensureSupplierProfile({
+      supplierId: '123456789',
+      supplierName: 'ACME Corp',
+      supplierTaxNumber: '123456789',
+      supplierCategory: 'food',
+      missingTaxNumber: false,
+    });
+
+    const setPayload = txSet.mock.calls[0][1];
+    expect(setPayload.missingTaxNumber).toBe(false);
+    expect(setPayload.supplierTaxNumber).toBe('123456789');
+  });
+
+  it('sets missingTaxNumber on existing supplier without a tax number', async () => {
+    const { txUpdate } = mockTransaction({
+      name: 'ACME Corp',
+      supplierCategory: 'food',
+      supplierTaxNumber: null,
+    });
+
+    await ensureSupplierProfile({
+      supplierId: 'acme-corp',
+      supplierName: 'ACME Corp',
+      supplierTaxNumber: null,
+      supplierCategory: null,
+      missingTaxNumber: true,
+    });
+
+    const updatePayload = txUpdate.mock.calls[0][1];
+    expect(updatePayload.missingTaxNumber).toBe(true);
+  });
+
+  it('does not overwrite missingTaxNumber when existing supplier already has a tax number', async () => {
+    const { txUpdate } = mockTransaction({
+      name: 'ACME Corp',
+      supplierCategory: 'food',
+      supplierTaxNumber: '999888777',
+    });
+
+    await ensureSupplierProfile({
+      supplierId: 'acme-corp',
+      supplierName: 'ACME Corp',
+      supplierTaxNumber: null,
+      supplierCategory: null,
+      missingTaxNumber: true,
+    });
+
+    expect(txUpdate).not.toHaveBeenCalled();
+  });
+
   it('returns OCR name as canonical when transaction fails', async () => {
     db.doc = vi.fn().mockReturnValue({ path: 'suppliers/test-id' });
     db.runTransaction = vi.fn().mockRejectedValue(new Error('TX failed'));

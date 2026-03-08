@@ -2,7 +2,7 @@ import { db, serverTimestamp } from './config.js';
 
 const EDITABLE_SUPPLIER_FIELDS = ['name', 'supplierCategory', 'supplierTaxNumber', 'delivery'];
 
-async function ensureSupplierProfile({ supplierId, supplierName, supplierTaxNumber, supplierCategory }) {
+async function ensureSupplierProfile({ supplierId, supplierName, supplierTaxNumber, supplierCategory, missingTaxNumber }) {
   if (!supplierId) {
     console.warn('Missing supplierId; skipping supplier profile update.');
     return { canonicalName: undefined };
@@ -18,6 +18,7 @@ async function ensureSupplierProfile({ supplierId, supplierName, supplierTaxNumb
           name: supplierName || null,
           supplierCategory: supplierCategory || null,
           supplierTaxNumber: supplierTaxNumber || null,
+          missingTaxNumber: missingTaxNumber || false,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         });
@@ -34,6 +35,9 @@ async function ensureSupplierProfile({ supplierId, supplierName, supplierTaxNumb
       }
       if (!current.supplierTaxNumber && supplierTaxNumber) {
         updates.supplierTaxNumber = supplierTaxNumber;
+      }
+      if (missingTaxNumber && !current.supplierTaxNumber) {
+        updates.missingTaxNumber = true;
       }
 
       if (Object.keys(updates).length) {
