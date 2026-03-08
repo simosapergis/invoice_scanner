@@ -41,9 +41,7 @@ Think like a **Principal GCP Architect**. Evaluate every decision through GCP-na
 
 **CLI tools** (project root): `auth_login.js` (sign-in, ID token), `upload_invoice.js` (auth → signed URL → upload), `signed_url_server.js` (local Express signed-URL server).
 
-**Scripts**: `scripts/setup_new_client.sh` — provisions new Firebase/GCP projects (APIs, Firestore, Storage, GCS CORS, IAM, `.env`, deploy). Run via `npm run setup:client`. `scripts/set_display_names.js` — one-time script to set `displayName` on Firebase Auth accounts.
-
-**Config**: `cors.json` — GCS bucket CORS config applied by setup script to `.appspot.com` and `.firebasestorage.app` buckets.
+**Scripts**: `scripts/setup_new_client.sh` — end-to-end client provisioning: creates GCP project, links billing, adds Firebase, enables APIs, provisions Firestore/Storage, configures CORS, assigns IAM roles, generates `.env`, deploys functions. Resumable via per-project state file. Run via `npm run setup:client`. `scripts/set_display_names.js` — one-time script to set `displayName` on Firebase Auth accounts.
 
 **Invoice processing pipeline**:
 1. Client → `getSignedUploadUrl_v2` → signed URL → uploads page(s) to GCS.
@@ -57,7 +55,7 @@ Think like a **Principal GCP Architect**. Evaluate every decision through GCP-na
 ## 3. Firebase & Deployment
 
 - **Region**: `europe-west3`.
-- **Projects** (`.firebaserc`): both `default` and `prod` → `level-approach-479119-b3`. Additional clients provisioned via `npm run setup:client`.
+- **Projects**: `.firebaserc` is gitignored (local working-state only); `firebase use <id>` sets the active project. New clients provisioned end-to-end via `npm run setup:client`.
 - **Blue-green**: all functions use `_v2` suffix (Gen 1 → Gen 2 migration).
 - **Env**: `functions/.env` written by `update-env-default.sh` / `update-env-prod.sh`; per-client snapshots as `functions/.env.<client>`. All matched by `.env*` in `.gitignore`. Functions use `defineString` — **not** `functions.config()`.
 - **Deploy**: manual via Firebase CLI. `firebase.json` predeploy runs lint + tests; failures abort deploy.
@@ -93,7 +91,7 @@ Think like a **Principal GCP Architect**. Evaluate every decision through GCP-na
 - **Lazy init**: OpenAI (`getOpenAIClient()`) and Vision (`getVisionClient()`) created on first use.
 - **Multi-page OCR optimization**: >2 pages → only first + last sent to OCR. Images: filtered in `runInvoiceOcr`. PDFs: via Vision `pages` parameter.
 - **PDF dual-path**: single PDF upload → skip `buildCombinedPdfFromPages`; GCS `file.copy()` + `batchAnnotateFiles` from URI.
-- **GCS CORS**: `cors.json` applied by `setup_new_client.sh` to both `.appspot.com` and `.firebasestorage.app` buckets.
+- **GCS CORS**: generated dynamically by `setup_new_client.sh` using `$PROJECT_ID` for origins; applied to both `.appspot.com` and `.firebasestorage.app` buckets.
 - **Dedup**: same supplier + invoice number with `processingStatus === 'uploaded'` = duplicate.
 - **European decimals**: comma separator (e.g., `1.234,56`). `normalizeEuropeanDecimals` before parsing.
 - **Secrets**: `.env` files and shell scripts — never commit.
