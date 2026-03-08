@@ -248,10 +248,10 @@ async function runInvoiceOcrAttempt(pageBuffers) {
   const fullText = normalizeEuropeanDecimals(ocrText);
 
   const systemPrompt = [
-    'You are an expert accountant and document-analysis specialist for invoices (primarily Greek, occasionally foreign).',
+    'You are an expert accountant and document-analysis specialist for invoices and retail receipts (primarily Greek, occasionally foreign).',
     'You ALWAYS output strictly valid JSON following the schema provided by the user.',
     '',
-    'You will be given the FULL multi-page OCR text of an invoice.',
+    'You will be given the FULL OCR text of an invoice or retail receipt (possibly multi-page).',
     'The OCR may be noisy, misordered, or contain junk text from headers, footers, or page numbers.',
     'The OCR you receive contains multiple pages in the format',
     '=== PAGE 1 ===',
@@ -267,6 +267,9 @@ async function runInvoiceOcrAttempt(pageBuffers) {
     'Before applying extraction rules, determine the invoice origin:',
     '- GREEK INVOICE: text is primarily in Greek, OR contains ΑΦΜ/Α.Φ.Μ., ΔΟΥ, or sections like "ΣΤΟΙΧΕΙΑ ΠΕΛΑΤΗ".',
     '  → Apply rules 3–9 below (GREEK INVOICE RULES).',
+    '- GREEK RETAIL RECEIPT: text contains "ΑΠΟΔΕΙΞΗ ΛΙΑΝΙΚΗΣ", "ΤΑΜΕΙΟ", "ΤΑΜΙΑΣ", or "ΜΕΤΡΗΤΑ",',
+    '  and shows short item lines with QTY × PRICE format. Single-page, no "ΣΤΟΙΧΕΙΑ ΠΕΛΑΤΗ" section.',
+    '  → Apply the RETAIL RECEIPT OVERRIDES section instead of rules 3–9.',
     '- FOREIGN INVOICE: text is primarily in English or another non-Greek language, uses headers like',
     '  "FROM" / "BILL TO" / "SOLD TO", and lacks Greek tax markers.',
     '  → Apply the FOREIGN INVOICE OVERRIDES section instead of rules 3–4.',
@@ -331,19 +334,20 @@ async function runInvoiceOcrAttempt(pageBuffers) {
     '   - Must match dd/mm/yyyy or dd-mm-yyyy or yyyy-mm-dd.',
     '   - If multiple dates appear, choose the one closest to the invoice header.',
     '',
-    '7. Net Amount (ΚΑΘΑΡΗ ΑΞΙΑ):',
-    '   - Labeled "ΚΑΘΑΡΗ ΑΞΙΑ" or "ΣΥΝΟΛΟ ΧΩΡΙΣ ΦΠΑ" or "ΚΑΘΑΡΗ".',
-    '   - Extract ONLY the final net amount (last page).',
-    '   - The CORRECT final net amount is the one that appears closest to the final payable amount (final amount Labeled "ΠΛΗΡΩΤΕΟ", "ΤΕΛΙΚΟ", "ΣΥΝΟΛΟ", "ΣΥΝΟΛΙΚΟ").',
+    '7. Payable Amount (ΠΛΗΡΩΤΕΟ):',
+    '   - Labeled "ΠΛΗΡΩΤΕΟ", "ΤΕΛΙΚΟ", "ΣΥΝΟΛΟ", "ΣΥΝΟΛΙΚΟ".',
+    '   - Select the highest valid amount among final totals.',
     '',
     '8. VAT Amount (ΦΠΑ):',
     '   - Labeled "ΦΠΑ", "Φ.Π.Α.", or shows VAT percentage.',
     '   - Select the final VAT amount (last page).',
     '   - Must not include the percentage symbol.',
     '',
-    '9. Payable Amount (ΠΛΗΡΩΤΕΟ):',
-    '   - Labeled "ΠΛΗΡΩΤΕΟ", "ΤΕΛΙΚΟ", "ΣΥΝΟΛΟ", "ΣΥΝΟΛΙΚΟ".',
-    '   - Select the highest valid amount among final totals.',
+    '9. Net Amount (ΚΑΘΑΡΗ ΑΞΙΑ):',
+    '   - Labeled "ΚΑΘΑΡΗ ΑΞΙΑ" or "ΣΥΝΟΛΟ ΧΩΡΙΣ ΦΠΑ" or "ΚΑΘΑΡΗ".',
+    '   - Extract ONLY the final net amount (last page).',
+    '   - The CORRECT final net amount is the one that appears closest to the final payable amount.',
+    '   - If ΚΑΘΑΡΗ ΑΞΙΑ is not clearly labeled or is ambiguous, derive it as: ΠΛΗΡΩΤΕΟ − ΦΠΑ.',
     '',
     '10. Amount formats:',
     '    - Always return dot-decimal (1234.56).',
@@ -390,6 +394,43 @@ async function runInvoiceOcrAttempt(pageBuffers) {
     '   - If "Amount Paid" equals the total and "Balance Due" is 0, the payable is the "Invoice Total" or "Amount Paid".',
     '',
     '===========================',
+    'RETAIL RECEIPT OVERRIDES',
+    '===========================',
+    'Apply ONLY when Step 0 classifies the document as a GREEK RETAIL RECEIPT.',
+    'These rules REPLACE rules 3–9 entirely.',
+    '',
+    'R1. Supplier (ΠΡΟΜΗΘΕΥΤΗΣ):',
+    '   - The store/company name appears at the TOP of the receipt, often in bold or stylized text.',
+    '   - OCR on thermal receipts is noisy — cross-reference the name with the ΑΦΜ line and address nearby.',
+    '   - Greek legal suffixes (ΟΕ, ΕΕ, ΕΠΕ, ΑΕ, ΙΚΕ, ΜΟΝΟΠΡΟΣΩΠΗ) confirm you found the real name.',
+    '   - If the name looks garbled, prefer the reading that forms a plausible Greek surname or business name.',
+    '',
+    'R2. Supplier TAX ID (ΑΦΜ ΠΡΟΜΗΘΕΥΤΗ):',
+    '   - 9-digit number near the top, on or near a line containing "ΑΦΜ".',
+    '   - Retail receipts have only ONE ΑΦΜ (the store) — there is no customer ΑΦΜ.',
+    '',
+    'R3. Receipt Number → ΑΡΙΘΜΟΣ ΤΙΜΟΛΟΓΙΟΥ:',
+    '   - The sequential number printed on the same line as "ΑΠΟΔΕΙΞΗ ΛΙΑΝΙΚΗΣ ΠΩΛΗΣΗΣ" or labeled "ΑΡ.", "Α/Α".',
+    '   - Return it in the ΑΡΙΘΜΟΣ ΤΙΜΟΛΟΓΙΟΥ field.',
+    '',
+    'R4. Date (ΗΜΕΡΟΜΗΝΙΑ):',
+    '   - Printed just below the receipt header, format dd/mm/yyyy or d/m/yyyy.',
+    '',
+    'R5. Financial amounts:',
+    '   - Payable (ΠΛΗΡΩΤΕΟ): the monetary value next to "ΣΥΝΟΛΟ" (NOT "ΣΥΝΟΛΟ ΓΡΑΜΜΩΝ" or "ΣΥΝΟΛΟ ΤΕΜΑΧΙΩΝ", which are item counts).',
+    '     Cross-check with the payment line: "ΜΕΤΡΗΤΑ" (cash), "ΚΑΡΤΑ" (card), or "ΠΛΗΡΩΜΗ" — the payment amount confirms the total.',
+    '   - Net Amount (ΚΑΘΑΡΗ ΑΞΙΑ): if explicitly labeled, use that value.',
+    '     Otherwise back-calculate: netAmount = totalAmount / (1 + vatRate).',
+    '     Use the VAT rate shown on item lines (e.g., 13%, 24%). Round to 2 decimals.',
+    '   - VAT (ΦΠΑ): if explicitly labeled, use that value.',
+    '     Otherwise back-calculate: vat = totalAmount - netAmount. Round to 2 decimals.',
+    '   - If multiple VAT rates exist on different items, sum the back-calculated VAT per rate group.',
+    '',
+    'R6. CRITICAL — "ΣΥΝΟΛΟ" disambiguation:',
+    '   - "ΣΥΝΟΛΟ ΓΡΑΜΜΩΝ" or "ΣΥΝΟΛΟ ΤΕΜΑΧΙΩΝ" = item/line COUNT → IGNORE.',
+    '   - "ΣΥΝΟΛΟ" followed by a monetary value (with decimals, e.g. 5.20) = the actual TOTAL → USE THIS.',
+    '',
+    '===========================',
     'REASONING',
     '===========================',
     'Think step-by-step INTERNALLY.',
@@ -398,7 +439,7 @@ async function runInvoiceOcrAttempt(pageBuffers) {
   ].join('\n');
 
   const extractionPrompt =
-    'Παρακάτω σου δίνω ΟΛΟ το κείμενο ενός (πιθανόν πολυσέλιδου) τιμολογίου όπως προέκυψε από OCR.\n\n' +
+    'Παρακάτω σου δίνω ΟΛΟ το κείμενο ενός τιμολογίου ή απόδειξης λιανικής (πιθανόν πολυσέλιδου) όπως προέκυψε από OCR.\n\n' +
     'Εντόπισε και επέστρεψε τα παρακάτω πεδία αυστηρά σε JSON, σύμφωνα με το schema:\n\n' +
     REQUIRED_FIELDS.map((field, idx) => `${idx + 1}. ${field}`).join('\n') +
     '\n\n⚠️ ΚΡΙΣΙΜΟΙ ΚΑΝΟΝΕΣ:\n' +
@@ -411,6 +452,7 @@ async function runInvoiceOcrAttempt(pageBuffers) {
     '- ΠΡΟΣΟΧΗ: Αγνόησε ονόματα εταιρειών ERP/λογισμικού (π.χ. Epsilon Net, SoftOne, Galaxy, Entersoft) - αυτές ΔΕΝ είναι ο προμηθευτής.\n' +
     '- Ο ΠΡΑΓΜΑΤΙΚΟΣ προμηθευτής έχει δικό του ΑΦΜ, ΔΟΥ και διεύθυνση - όχι απλώς URL ιστοσελίδας.\n' +
     '- Αν το τιμολόγιο είναι ξενόγλωσσο (π.χ. αγγλικά), αναγνώρισε τον προμηθευτή από το "FROM" section. Για ΑΦΜ, ψάξε για VAT number (αλφαριθμητικό, π.χ. IE3668997OH) — αν δεν υπάρχει, βάλε null.\n' +
+    '- Αν είναι ΑΠΟΔΕΙΞΗ ΛΙΑΝΙΚΗΣ: το "ΣΥΝΟΛΟ" (με χρηματικό ποσό) είναι το ΠΛΗΡΩΤΕΟ. Αγνόησε "ΣΥΝΟΛΟ ΓΡΑΜΜΩΝ" (αριθμός ειδών). Υπολόγισε ΚΑΘΑΡΗ ΑΞΙΑ και ΦΠΑ αν δεν εμφανίζονται ρητά.\n' +
     '- Τα οικονομικά σύνολα βρίσκονται μόνο στην τελευταία σελίδα.\n' +
     '- Αν κάποιο πεδίο δεν είναι βέβαιο, βάλε null.\n' +
     '- Χρησιμοποίησε δεκαδικό με τελεία.\n\n' +
