@@ -5,6 +5,8 @@ invoice.*
 *.log
 update-env-*.sh
 .firebase/
+.firebaserc
+.setup_state_*
 functions.config.json
 .runtimeconfig.json
 
