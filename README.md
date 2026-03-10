@@ -1,158 +1,163 @@
 # invoice_scanner
-Scan invoices and extract fields using OCR.
+
+Greek invoice scanning backend on Firebase Cloud Functions (Gen 2) with CLI tools.
 
 ## Prerequisites
-- Node.js 18+ installed
-- An OpenAI API key with access to GPT-4o / Responses API
 
-## macOS / Linux
-### Installation
+- Node.js 22+
+- Firebase CLI (`npm install -g firebase-tools`)
+- A GCP project with Cloud Vision API enabled
+- An OpenAI API key (GPT-4o-mini)
+
+## Quick Start
+
 ```bash
 npm install
+cd functions && npm install && cd ..
 ```
 
-### Usage
-```bash
-export OPENAI_API_KEY=sk-...
-npm run invoice:ocr                 # uses invoice.JPG
-# or OCR a specific file
-node invoice_ocr.js my_invoice.pdf
+### New Client Provisioning
 
-# One-shot upload (auth → signed URL → PUT)
-export FIREBASE_API_KEY=your-firebase-web-api-key
-export FIREBASE_AUTH_EMAIL=your-user@example.com
-export FIREBASE_AUTH_PASSWORD=super-secret
-export FIREBASE_PROJECT_ID=level-approach-479119-b3          # or set SIGNED_URL_ENDPOINT directly
-export FIREBASE_FUNCTION_REGION=europe-west8                 # default is us-central1
-# Start a new invoice (page 1 of 3)
-npm run upload:invoice -- ./invoice-page1.jpg --page 1 --total-pages 3 --content-type image/jpeg
-# Reuse the invoiceId returned above for the remaining pages
-npm run upload:invoice -- ./invoice-page2.jpg --page 2 --invoice-id <invoiceId>
-npm run upload:invoice -- ./invoice-page3.jpg --page 3 --invoice-id <invoiceId>
+The `setup:client` script handles end-to-end project setup: GCP project creation, billing, Firebase, APIs, Firestore/Storage, CORS, IAM, `.env` generation, and function deployment.
+
+```bash
+npm run setup:client
 ```
 
-The script uploads the invoice to GPT-4o, performs OCR in Greek, and prints the requested fields plus an `ΑΚΡΙΒΕΙΑ` confidence percentage. Uncomment the schema block in `invoice_ocr.js` if you want to enforce JSON output strictly.
+## CLI Tools
 
-### CLI Firebase Auth (Email/Password)
+### Firebase Auth (`auth_login.js`)
+
+Sign in with email/password and obtain an ID token for authenticated API calls.
+
 ```bash
-export FIREBASE_API_KEY=your-firebase-web-api-key
-# optional: export FIREBASE_AUTH_EMAIL=...
-# optional: export FIREBASE_AUTH_PASSWORD=...
+export FIREBASE_API_KEY=<your-firebase-web-api-key>
+# optional: export FIREBASE_AUTH_EMAIL=<email>
+# optional: export FIREBASE_AUTH_PASSWORD=<password>
 npm run auth:login
 ```
 
-The script calls Firebase Authentication’s REST API and prints the ID token and refresh token, which you can then use to request signed upload URLs from your backend.
+### Invoice Upload (`upload_invoice.js`)
 
-### Signed URL API (Node server)
+One-shot upload: authenticates, requests a signed URL, and PUTs the file.
+
 ```bash
-export FIREBASE_PROJECT_ID=your-project-id
-export GCS_BUCKET=your-upload-bucket
+export FIREBASE_API_KEY=<your-firebase-web-api-key>
+export FIREBASE_AUTH_EMAIL=<email>
+export FIREBASE_AUTH_PASSWORD=<password>
+export FIREBASE_PROJECT_ID=<your-project-id>
+export FIREBASE_FUNCTION_REGION=europe-west3
+
+# Start a new invoice (page 1 of 3)
+npm run upload:invoice -- ./page1.jpg --page 1 --total-pages 3 --content-type image/jpeg
+# Subsequent pages reuse the invoiceId returned above
+npm run upload:invoice -- ./page2.jpg --page 2 --invoice-id <invoiceId>
+npm run upload:invoice -- ./page3.jpg --page 3 --invoice-id <invoiceId>
+```
+
+### Signed URL Server (`signed_url_server.js`)
+
+Local Express server for requesting signed upload URLs during development.
+
+```bash
+export FIREBASE_PROJECT_ID=<your-project-id>
+export GCS_BUCKET=<your-upload-bucket>
 export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
 npm run signed-url:server
 ```
-
-Request an upload URL with the ID token you obtained earlier:
 
 ```bash
 curl -X POST http://localhost:8080/signed-url \
   -H "Authorization: Bearer $FIREBASE_ID_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"filename":"invoice-page1.jpg","contentType":"image/jpeg","pageNumber":1,"totalPages":3}'
+  -d '{"filename":"page1.jpg","contentType":"image/jpeg","pageNumber":1,"totalPages":3}'
 ```
 
-The response contains a `uploadUrl` (V4 signed URL) and `objectName`. Upload the file via HTTP PUT using the provided `uploadUrl`. Reuse the returned `invoiceId` for every subsequent page by including it (together with the new `pageNumber`) in later POST requests; `totalPages` only needs to be supplied once per invoice.
+The response contains `uploadUrl` (V4 signed URL), `objectName`, and `invoiceId`. Reuse the `invoiceId` for subsequent pages; `totalPages` only needs to be supplied once.
 
-### Cloud Function (production)
-Deploy the same logic to Firebase Functions:
-1. Set the bucket config once:  
-   `firebase functions:config:set uploads.bucket="your-upload-bucket"`
-2. Deploy: `firebase deploy --only functions:getSignedUploadUrl`
-3. Call the HTTPS endpoint (e.g. `https://<region>-<project>.cloudfunctions.net/getSignedUploadUrl`) with the same POST body and `Authorization: Bearer <Firebase ID token>`.
+## Cloud Functions
 
-### Multi-page workflow overview
-1. Request signed URLs per page using `getSignedUploadUrl`. The first page must include `totalPages`; the function returns a persistent `invoiceId`.
-2. Upload each page to its signed URL. The Storage finalize trigger (`processUploadedInvoice`) automatically records the page inside Firestore at `invoices/{invoiceId}`.
-3. When every page is present, the metadata document flips to `ready`, which triggers `processInvoiceDocument`.
-4. `processInvoiceDocument` downloads all recorded pages, merges them into a single PDF, performs Vision + OpenAI OCR once, stores the normalized PDF under `suppliers/{supplierId}/invoices/{invoiceId}.pdf`, and writes the structured data back to Firestore.
+All functions are exported from `functions/index.js` with a `_v2` suffix (Gen 2). Region: `europe-west3`.
 
-Invoice document statuses flow as: `pending → ready → processing → done`. If something fails, the status becomes `error` with `errorMessage` so you can retry by resetting the status to `pending`.
+| Function | Type | Description |
+|---|---|---|
+| `getSignedUploadUrl_v2` | HTTP | Returns a signed GCS upload URL for a single page |
+| `processUploadedInvoice_v2` | Storage trigger | Registers an uploaded page in `metadata_invoices` |
+| `processInvoiceDocument_v2` | Firestore trigger | Runs OCR pipeline when all pages are uploaded |
+| `updatePaymentStatus_v2` | HTTP | Records a payment against an invoice |
+| `updateInvoiceFields_v2` | HTTP | Updates editable fields on an invoice |
+| `updateSupplierFields_v2` | HTTP | Updates supplier profile fields |
+| `getSignedDownloadUrl_v2` | HTTP | Returns a signed GCS download URL for a stored invoice |
+| `addFinancialEntry_v2` | HTTP | Creates a financial entry (income/expense) |
+| `deleteFinancialEntry_v2` | HTTP | Deletes a financial entry |
+| `getFinancialReport_v2` | HTTP | Returns aggregated financial data for a period |
+| `addRecurringExpense_v2` | HTTP | Creates a recurring expense definition |
+| `updateRecurringExpense_v2` | HTTP | Updates an existing recurring expense |
+| `processRecurringExpenses_v2` | Scheduled | Generates monthly financial entries from recurring expenses |
+| `getRecurringExpenses_v2` | HTTP | Lists recurring expenses |
+| `exportInvoices_v2` | HTTP | Streams a ZIP of invoices matching filter criteria |
 
-## Windows (PowerShell)
-### Installation
-```powershell
-npm install
-```
+## Invoice Processing Pipeline
 
-### Usage
-```powershell
-$env:OPENAI_API_KEY = "sk-..."
-npm run invoice:ocr                 # uses invoice.JPG
-# or OCR a specific file
-node invoice_ocr.js .\my_invoice.pdf
+1. Client requests signed URLs via `getSignedUploadUrl_v2` and uploads page(s) to GCS.
+2. Storage trigger (`processUploadedInvoice_v2`) registers each page in the `metadata_invoices` Firestore document.
+3. When all pages arrive, the document status flips to `ready`.
+4. Firestore trigger (`processInvoiceDocument_v2`) picks it up with two paths:
+   - **Images**: combines pages into a single PDF, runs Vision `documentTextDetection` on first + last pages, sends text to GPT-4o-mini for structured extraction, stores the PDF under `suppliers/{id}/invoices/`.
+   - **PDF** (single file): runs Vision `batchAnnotateFiles` from the GCS URI, sends text to GPT-4o-mini, copies the file to its final path via `file.copy()`.
+5. Post-OCR: dedup check (supplier + invoice number), supplier upsert, invoice document creation.
 
-# Firebase email/password login (prints ID token)
-$env:FIREBASE_API_KEY = "your-firebase-web-api-key"
-npm run auth:login
+**Status flow**: `pending` → `ready` → `processing` → `done` | `error`
 
-# One-shot upload (auth → signed URL → PUT)
-$env:FIREBASE_API_KEY = "your-firebase-web-api-key"
-$env:FIREBASE_AUTH_EMAIL = "your-user@example.com"
-$env:FIREBASE_AUTH_PASSWORD = "super-secret"
-$env:FIREBASE_PROJECT_ID = "level-approach-479119-b3"   # or set SIGNED_URL_ENDPOINT
-#$env:FIREBASE_FUNCTION_REGION = "europe-west8"
-# Page 1 of a 2-page invoice
-npm run upload:invoice -- .\invoice-page1.jpg --page 1 --total-pages 2 --content-type image/jpeg
-# Subsequent pages reuse the invoiceId returned earlier
-npm run upload:invoice -- .\invoice-page2.jpg --page 2 --invoice-id <invoiceId>
+## Deployment
 
-# Signed URL server
-$env:FIREBASE_PROJECT_ID = "your-project-id"
-$env:GCS_BUCKET = "your-upload-bucket"
-$env:GOOGLE_APPLICATION_CREDENTIALS = "C:\path\to\service-account.json"
-npm run signed-url:server
-
-# Cloud Function config (one-time)
-firebase functions:config:set uploads.bucket="your-upload-bucket"
-
-# Deploy all functions (whole index.js)
-firebase deploy --only functions --project level-approach-479119-b3
-# Deploy specific function (e.g getSignedUploadUrl)
-firebase deploy --only functions:getSignedUploadUrl
-```
-
-# Extract current rules and indexes from google console
-firebase init firestore
-
-# Deploy firestore rules and indexes [firestore.rules, firestore.indexes.json] referenced in firebase.json
-firebase deploy --only firestore:rules,firestore:indexes
-
-# Export Cloud Functions runtime config / env  (Legacy)
-firebase functions:config:get > functions.config.json
-
-# Deploy cloud functions
-
-
-###### Starting a new project (clone) ######
-
-# 0. Create bucket
-gcloud storage buckets create gs://${PROJECT_NAME} \
-  --location=europe-west8 \
-  --uniform-bucket-level-access
-
-# 1. Point to prod in .firebaserc
-firebase use prod
-
-# 2. Verify selected project
-firebase use 
-
-# 3. Create rules/indexes for firestore (no collection needs to be created prior)
-firebase deploy --only firestore:rules,firestore:indexes
-
-# 4. Set functions config (v1)
-firebase functions:config:set uploads.bucket="level-approach-479119-b3.firebasestorage.app"
-firebase functions:config:set serviceAccount.email="mylogia@level-approach-479119-b3.iam.gserviceaccount.com"
-firebase functions:config:set region.name="europe-west8"
-firebase functions:config:set openai.key="<..>"
-
-# 5. Deploy functions
+```bash
+# Deploy all functions
 firebase deploy --only functions
+
+# Deploy a specific function
+firebase deploy --only functions:getSignedUploadUrl_v2
+
+# Deploy Firestore rules and indexes
+firebase deploy --only firestore:rules,firestore:indexes
+```
+
+`firebase.json` predeploy runs lint + tests; failures abort the deploy.
+
+## Development
+
+```bash
+# Lint
+npm run lint --prefix functions
+
+# Format
+npm run format --prefix functions
+
+# Run tests
+npm test --prefix functions
+
+# Watch mode
+npm run test:watch --prefix functions
+```
+
+### Emulators
+
+```bash
+firebase emulators:start
+```
+
+| Service | Port |
+|---|---|
+| Auth | 9099 |
+| Functions | 5001 |
+| Firestore | 5002 |
+| Storage | 5003 |
+| Emulator UI | 5004 |
+
+### Pre-commit Hooks
+
+`simple-git-hooks` + `lint-staged` automatically run lint and tests on staged `functions/**/*.js` files before each commit.
+
+## Environment
+
+Functions use `defineString` parameters (Gen 2). Per-client env files are stored as `functions/.env.<client>` (gitignored). The `setup:client` script generates these automatically.

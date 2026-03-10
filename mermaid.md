@@ -2,35 +2,41 @@
 flowchart TD
 
     %% CLIENT SIDE
-    A[User takes photo\n PWA] --> B[Client checks image quality\nresolution, blur, file type]
-    B -->|If HEIC/PNG| C[Convert to JPG client-side]
-    B -->|If OK| C
+    A[Client requests signed URL\ngetSignedUploadUrl_v2] --> B[Upload page to GCS\nvia signed URL PUT]
+    B --> B2{More pages?}
+    B2 -->|Yes| A
+    B2 -->|No| C[All pages uploaded]
 
-    C --> D[Request Signed URL from Cloud Function]
-    D --> E[Upload raw file to GCS\nraw-invoices/uploadId/original.jpg]
+    %% STORAGE TRIGGER
+    B --> D[Storage trigger:\nprocessUploadedInvoice_v2]
+    D --> E[Register page in\nmetadata_invoices]
+    E --> F{All pages\npresent?}
+    F -->|No| G[Status: pending\nwait for remaining pages]
+    F -->|Yes| H[Status: ready]
 
-    E --> F[Return success to app immediately]
-    F --> G[App shows 'Processing Invoice' screen]
+    %% FIRESTORE TRIGGER
+    H --> I[Firestore trigger:\nprocessInvoiceDocument_v2]
+    I --> J[Status: processing]
+    J --> K{File type?}
 
-    %% SERVER SIDE
-    E --> H[Cloud Function Trigger:\nonFinalize raw-invoices/...]
-    H --> I[Download uploaded file]
-    I --> J[Convert to PDF server-side]
+    %% IMAGE PATH
+    K -->|Images| L[Combine pages into PDF\nbuildCombinedPdfFromPages]
+    L --> M[Vision documentTextDetection\nfirst + last pages]
+    M --> N[GPT-4o-mini\nstructured extraction]
+    N --> O[Store PDF under\nsuppliers/id/invoices/]
 
-    J --> K[Send file to OpenAI API\nOCR + Data Extraction]
+    %% PDF PATH
+    K -->|PDF| P[Vision batchAnnotateFiles\nfrom GCS URI, pages 1 + N]
+    P --> Q[GPT-4o-mini\nstructured extraction]
+    Q --> R[Copy PDF to final path\nfile.copy]
 
-    K --> L[Extract supplier data:\nname, VAT, identifiers]
+    %% POST-OCR
+    O --> S[Dedup check:\nsupplier + invoice number]
+    R --> S
+    S --> T[Supplier upsert]
+    T --> U[Create invoice document\nin Firestore]
+    U --> V[Status: done]
 
-    L --> MDoes supplier exist\nin Firestore?
-    M -->|Yes| N[Get supplierId]
-    M -->|No| O[Create supplier\ndocument in Firestore]
-    O --> N
-
-    N --> P[Create invoiceId]
-    P --> Q[Move file:\ncopy raw → suppliers/supplierId/invoices/invoiceId.pdf]
-    Q --> R[Delete raw file]
-
-    R --> S[Create invoice document in Firestore]
-    S --> T[Send FCM notification: 'Invoice ready']
-
-    T --> U[User opens invoice details screen]
+    %% ERROR
+    J -.->|Failure| W[Status: error\nwith errorMessage]
+```

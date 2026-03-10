@@ -1,6 +1,13 @@
 node_modules/
-.env
+.env*
 .DS_Store
 invoice.*
-firebase-debug.log
+*.log
+update-env-*.sh
+.firebase/
+.firebaserc
+.setup_state_*
+firebase-config.*.json
+functions.config.json
+.runtimeconfig.json
 

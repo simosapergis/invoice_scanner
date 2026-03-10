@@ -1,854 +1,101 @@
-const functions = require('firebase-functions');
-const admin = require('firebase-admin');
-const { Storage } = require('@google-cloud/storage');
-const vision = require('@google-cloud/vision');
-const { PDFDocument } = require('pdf-lib');
-const OpenAI = require('openai');
-const crypto = require('crypto');
-
-const app = admin.initializeApp();
-
-const storage = new Storage();
-const visionClient = new vision.ImageAnnotatorClient();
-const db = admin.firestore();
-const UPLOADS_PREFIX = 'uploads/';
-const METADATA_INVOICE_COLLECTION = 'metadata_invoices';
-const SERVICE_ACCOUNT_EMAIL = process.env.SERVICE_ACCOUNT_EMAIL || undefined;
-const REGION = process.env.REGION || 'europe-west6';
-
-console.log('env SERVICE_ACCOUNT_EMAIL', SERVICE_ACCOUNT_EMAIL);
-console.log('env REGION', REGION);
-
-// Build runWith options - only include serviceAccount if defined
-const FUNCTION_OPTIONS = SERVICE_ACCOUNT_EMAIL 
-  ? { serviceAccount: SERVICE_ACCOUNT_EMAIL }
-  : {};
-
-const SIGNED_URL_TTL_MS = 15 * 60 * 1000;
-const INVOICE_STATUS = {
-  pending: 'pending',
-  ready: 'ready',
-  processing: 'processing',
-  done: 'done',
-  uploaded: 'uploaded',
-  error: 'error'
-};
-const PAYMENT_STATUS = {
-  unpaid: 'unpaid',
-  paid: 'paid',
-  partiallyPaid: 'partially_paid'
-};
+// Firebase Functions v2 imports
+import { onRequest } from 'firebase-functions/v2/https';
+import { onObjectFinalized } from 'firebase-functions/v2/storage';
+import { onDocumentWritten } from 'firebase-functions/v2/firestore';
+import { onSchedule } from 'firebase-functions/v2/scheduler';
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// FINANCIAL TRACKING CONSTANTS
+// LIB IMPORTS
 // ═══════════════════════════════════════════════════════════════════════════════
-const FINANCIAL_ENTRIES_COLLECTION = 'financial_entries';
-//TODO: add financial summaries collection in case there is a performance issue
-// const FINANCIAL_SUMMARIES_COLLECTION = 'financial_summaries'; 
-const RECURRING_EXPENSES_COLLECTION = 'recurring_expenses';
 
-const ENTRY_TYPE = {
-  income: 'income',
-  expense: 'expense'
-};
-
-const ENTRY_SOURCE = {
-  manual: 'manual',
-  invoicePayment: 'invoice_payment',
-  recurring: 'recurring'
-};
-
-// Income categories
-const INCOME_CATEGORY = {
-  cashSales: 'cash_sales',
-  cardSales: 'card_sales',
-  otherIncome: 'other_income'
-};
-
-// Expense categories - ΠΑΓΙΑ ΜΗΝΑ (Fixed Monthly) + Invoice Payments
-const EXPENSE_CATEGORY = {
-  electricity: 'ΡΕΥΜΑ',           // Electricity
-  telecom: 'ΤΗΛΕΦΩΝΙΑ',               // Telecom
-  rent: 'ΕΝΟΙΚΙΟ',              // Rent
-  salaries: 'ΜΙΣΘΟΙ',        // Staff/Salaries
-  accountant: 'ΛΟΓΙΣΤΗΣ',       // Accountant
-  invoicePayment: 'ΠΛΗΡΩΜΗ_ΤΙΜΟΛΟΓΙΟΥ',  // Invoice Payment (auto-generated)
-  other: 'ΑΛΛΑ'                 // Other
-};
-
-const VALID_INCOME_CATEGORIES = Object.values(INCOME_CATEGORY);
-const VALID_EXPENSE_CATEGORIES = Object.values(EXPENSE_CATEGORY);
-
-const serverTimestamp = admin.firestore.FieldValue.serverTimestamp;
-const REQUIRED_FIELDS = [
-  'ΗΜΕΡΟΜΗΝΙΑ',
-  'ΑΡΙΘΜΟΣ ΤΙΜΟΛΟΓΙΟΥ',
-  'ΠΡΟΜΗΘΕΥΤΗΣ',
-  'ΑΦΜ ΠΡΟΜΗΘΕΥΤΗ',
-  'ΚΑΘΑΡΗ ΑΞΙΑ',
-  'ΦΠΑ',
-  'ΠΛΗΡΩΤΕΟ',
-  'ΑΚΡΙΒΕΙΑ'
-];
-
-const FIELD_LABELS = {
-  'ΗΜΕΡΟΜΗΝΙΑ': 'invoiceDate',
-  'ΑΡΙΘΜΟΣ ΤΙΜΟΛΟΓΙΟΥ': 'invoiceNumber',
-  'ΠΡΟΜΗΘΕΥΤΗΣ': 'supplierName',
-  'ΑΦΜ ΠΡΟΜΗΘΕΥΤΗ': 'supplierTaxNumber',
-  'ΚΑΘΑΡΗ ΑΞΙΑ': 'netAmount',
-  'ΦΠΑ': 'vat',
-  'ΠΛΗΡΩΤΕΟ': 'totalAmount',
-  'ΑΚΡΙΒΕΙΑ': 'confidence'
-};
-
-const METADATA_ERROR_MESSAGE = "❌ Aποτυχία τιμολογίου ΤΔΑ-%s από %s. %s";
-const METADATA_SUCCESS_MESSAGE = "✅ Επιτυχία τιμολογίου ΤΔΑ-%s από %s.";
-
-/**
- * Formats error message with prefix if invoiceNumber and supplierName are known.
- */
-function formatMetadataError(invoiceNumber, supplierName, errorMsg) {
-  if (invoiceNumber && supplierName && supplierName !== 'Unknown Supplier') {
-    return METADATA_ERROR_MESSAGE
-      .replace('%s', invoiceNumber)
-      .replace('%s', supplierName)
-      .replace('%s', errorMsg);
-  }
-  return errorMsg;
-}
-
-/**
- * Formats success message with invoiceNumber and supplierName.
- */
-function formatMetadataSuccess(invoiceNumber, supplierName) {
-    return METADATA_SUCCESS_MESSAGE
-      .replace('%s', invoiceNumber)
-      .replace('%s', supplierName);
-}
-
-const openAiApiKey = process.env.OPENAI_API_KEY;
-const openaiClient = openAiApiKey ? new OpenAI({ apiKey: openAiApiKey }) : null;
-const OCR_MAX_RETRIES = 3;
-
-
-function extractBearerToken(headerValue) {
-  if (!headerValue) return null;
-  const match = headerValue.match(/^Bearer\s+(.+)$/i);
-  return match ? match[1] : null;
-}
-
-function sanitizeFilename(name) {
-  return name ? name.replace(/[^a-zA-Z0-9._-]/g, '_') : crypto.randomUUID();
-}
-
-function sanitizeId(value, fallback) {
-  if (!value) return fallback;
-  return value
-    .toString()
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .substring(0, 64) || fallback;
-}
-
-function parseAmount(value) {
-  if (value === null || value === undefined) return null;
-
-  // Remove everything except digits, dot, and minus (decimals already normalized before GPT)
-  const str = value.toString().replace(/[^\d.\-]/g, '');
-  if (!str) return null;
-
-  const num = Number(str);
-  return Number.isFinite(num) ? num : null;
-}
-
-/**
- * Normalize European decimal format in OCR text before sending to GPT.
- * Converts "2.383,13" → "2383.13" so GPT sees standard decimal notation.
- */
-function normalizeEuropeanDecimals(text) {
-  // Match European format: optional thousands separators (.) followed by comma decimal
-  // Examples: 2.383,13 | 383,13 | 1.234.567,89
-  return text.replace(
-    /\b(\d{1,3}(?:\.\d{3})*),(\d{1,2})\b/g,
-    (_, intPart, decPart) => intPart.replace(/\./g, '') + '.' + decPart
-  );
-}
-
-function parseDate(value) {
-  if (!value) return null;
-
-  // European format: dd/mm/yyyy or dd-mm-yyyy
-  const euMatch = value.match(/^(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})$/);
-  if (euMatch) {
-    const [, day, month, year] = euMatch;
-    const date = new Date(Date.UTC(
-      parseInt(year, 10),
-      parseInt(month, 10) - 1,
-      parseInt(day, 10)
-    ));
-    if (!Number.isNaN(date.getTime())) {
-      return admin.firestore.Timestamp.fromDate(date);
-    }
-  }
-
-  // ISO format: yyyy-mm-dd
-  const isoMatch = value.match(/^(\d{4})[/\-](\d{1,2})[/\-](\d{1,2})$/);
-  if (isoMatch) {
-    const [, year, month, day] = isoMatch;
-    const date = new Date(Date.UTC(
-      parseInt(year, 10),
-      parseInt(month, 10) - 1,
-      parseInt(day, 10)
-    ));
-    if (!Number.isNaN(date.getTime())) {
-      return admin.firestore.Timestamp.fromDate(date);
-    }
-  }
-
-  // Fallback for other formats
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return null;
-  return admin.firestore.Timestamp.fromDate(date);
-}
-
-async function ensureSupplierProfile({
-  supplierId,
-  supplierName,
-  supplierTaxNumber,
-  supplierCategory
-}) {
-  if (!supplierId) {
-    console.warn('Missing supplierId; skipping supplier profile update.');
-    return;
-  }
-
-  const supplierRef = db.doc(`suppliers/${supplierId}`);
- //TODO:if supplier already exists, do not update the profile
-
-  try {
-    await db.runTransaction(async (tx) => {
-      const snap = await tx.get(supplierRef);
-      if (!snap.exists) {
-        tx.set(supplierRef, {
-          name: supplierName || null,
-          supplierCategory: supplierCategory || null,
-          supplierTaxNumber: supplierTaxNumber || null,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp()
-        });
-        return;
-      }
-
-      const current = snap.data() || {};
-      const updates = {};
-      if (!current.name && supplierName) {
-        updates.name = supplierName;
-      }
-      if (!current.supplierCategory && supplierCategory) {
-        updates.supplierCategory = supplierCategory;
-      }
-      if (!current.supplierTaxNumber && supplierTaxNumber) {
-        updates.supplierTaxNumber = supplierTaxNumber;
-      }
-
-      if (Object.keys(updates).length) {
-        updates.updatedAt = serverTimestamp();
-        tx.update(supplierRef, updates);
-      }
-    });
-  } catch (error) {
-    console.error(`Failed to upsert supplier profile for ${supplierId}`, error);
-  }
-}
-
-function collectResponseText(response) {
-  const chunks = [];
-  if (Array.isArray(response?.output)) {
-    for (const block of response.output) {
-      if (!Array.isArray(block?.content)) continue;
-      for (const part of block.content) {
-        if (typeof part?.text === 'string') chunks.push(part.text);
-        else if (typeof part?.output_text === 'string') chunks.push(part.output_text);
-        else if (typeof part?.value === 'string') chunks.push(part.value);
-      }
-    }
-  }
-  if (Array.isArray(response?.output_text)) {
-    chunks.push(...response.output_text);
-  }
-  return chunks.join('\n').trim();
-}
-
-function parseJsonFromResponse(text) {
-  if (!text) throw new Error('Empty OCR response');
-  try {
-    return JSON.parse(text);
-  } catch {
-    const match = text.match(/\{[\s\S]*\}/);
-    if (!match) throw new Error('No JSON found in OCR response');
-    return JSON.parse(match[0]);
-  }
-}
-
-function getBucketName() {
-  return process.env.GCS_BUCKET;
-}
-
-function invoiceDocRef(invoiceId) {
-  return db.collection(METADATA_INVOICE_COLLECTION).doc(invoiceId);
-}
-
-function normalizeInvoiceId(invoiceId) {
-  return invoiceId || crypto.randomUUID();
-}
-
-function normalizeTotalPages(totalPages) {
-  if (totalPages === undefined || totalPages === null) return null;
-  const value = Number(totalPages);
-  if (!Number.isInteger(value) || value <= 0) {
-    throw new Error('totalPages must be a positive integer');
-  }
-  return value;
-}
-
-function normalizePageNumber(pageNumber) {
-  const value = Number(pageNumber);
-  if (!Number.isInteger(value) || value <= 0) {
-    throw new Error('pageNumber must be a positive integer');
-  }
-  return value;
-}
-
-function padPageNumber(pageNumber) {
-  return String(pageNumber).padStart(3, '0');
-}
-
-async function ensureInvoiceDocument({ invoiceId, uid, bucketName, totalPages }) {
-  const resolvedInvoiceId = normalizeInvoiceId(invoiceId);
-  const normalizedTotalPages = normalizeTotalPages(totalPages);
-  const docRef = invoiceDocRef(resolvedInvoiceId);
-
-  const metadata = await db.runTransaction(async (tx) => {
-    const snap = await tx.get(docRef);
-    if (!snap.exists) {
-      if (normalizedTotalPages === null) {
-        throw new Error('totalPages must be provided when starting a new invoice.');
-      }
-
-      tx.set(docRef, {
-        invoiceId: resolvedInvoiceId,
-        ownerUid: uid,
-        bucket: bucketName,
-        storageFolder: `${UPLOADS_PREFIX}${resolvedInvoiceId}`,
-        status: INVOICE_STATUS.pending,
-        totalPages: normalizedTotalPages,
-        uploadedPages: [],
-        uploadedCount: 0,
-        pages: [],
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-        notificationSeen: false,
-      });
-
-      return {
-        invoiceId: resolvedInvoiceId,
-        totalPages: normalizedTotalPages,
-        bucket: bucketName,
-        status: INVOICE_STATUS.pending
-      };
-    }
-
-    const existing = snap.data();
-    if (
-      existing.totalPages &&
-      normalizedTotalPages &&
-      existing.totalPages !== normalizedTotalPages
-    ) {
-      throw new Error('totalPages does not match the existing invoice metadata');
-    }
-
-    tx.update(docRef, {
-      totalPages: existing.totalPages || normalizedTotalPages || null,
-      bucket: existing.bucket || bucketName,
-      ownerUid: existing.ownerUid || uid,
-      updatedAt: serverTimestamp()
-    });
-
-    return {
-      ...existing,
-      invoiceId: resolvedInvoiceId,
-      totalPages: existing.totalPages || normalizedTotalPages || null,
-      bucket: existing.bucket || bucketName,
-      status: existing.status || INVOICE_STATUS.pending
-    };
-  });
-
-  return metadata;
-}
-
-async function registerUploadedPage({
-  invoiceId,
-  pageNumber,
-  objectName,
-  bucketName,
-  contentType,
-  totalPages,
-  uid
-}) {
-  const normalizedPageNumber = normalizePageNumber(pageNumber);
-  const normalizedTotalPages = normalizeTotalPages(totalPages);
-  const docRef = invoiceDocRef(invoiceId);
-
-  const result = await db.runTransaction(async (tx) => {
-    const snap = await tx.get(docRef);
-    if (!snap.exists) {
-      throw new Error(`Invoice ${invoiceId} metadata not found`);
-    }
-
-    const data = snap.data();
-    if (data.ownerUid && uid && data.ownerUid !== uid) {
-      throw new Error('You do not have access to this invoice.');
-    }
-
-    const resolvedTotalPages = data.totalPages || normalizedTotalPages;
-    if (!resolvedTotalPages) {
-      throw new Error('totalPages must be specified before uploading pages');
-    }
-
-    if (normalizedTotalPages && resolvedTotalPages !== normalizedTotalPages) {
-      throw new Error('totalPages does not match existing metadata');
-    }
-
-    if (normalizedPageNumber > resolvedTotalPages) {
-      throw new Error('pageNumber cannot exceed totalPages');
-    }
-
-    const uploadedPages = new Set(Array.isArray(data.uploadedPages) ? data.uploadedPages : []);
-    uploadedPages.add(normalizedPageNumber);
-
-    const pages = Array.isArray(data.pages)
-      ? data.pages.filter((entry) => entry?.pageNumber !== normalizedPageNumber)
-      : [];
-    pages.push({
-      pageNumber: normalizedPageNumber,
-      objectName,
-      bucket: bucketName,
-      contentType: contentType || 'application/octet-stream',
-      recordedAt: admin.firestore.Timestamp.now()
-    });
-    pages.sort((a, b) => a.pageNumber - b.pageNumber);
-
-    const shouldMarkReady =
-      uploadedPages.size === resolvedTotalPages && data.status === INVOICE_STATUS.pending;
-
-    tx.update(docRef, {
-      totalPages: resolvedTotalPages,
-      uploadedPages: Array.from(uploadedPages).sort((a, b) => a - b),
-      uploadedCount: uploadedPages.size,
-      pages,
-      bucket: bucketName || data.bucket,
-      ownerUid: data.ownerUid || uid,
-      status: shouldMarkReady ? INVOICE_STATUS.ready : data.status,
-      readyAt: shouldMarkReady ? serverTimestamp() : data.readyAt || null,
-      updatedAt: serverTimestamp()
-    });
-
-    return {
-      invoiceId,
-      status: shouldMarkReady ? INVOICE_STATUS.ready : data.status,
-      uploadedPages: Array.from(uploadedPages),
-      totalPages: resolvedTotalPages
-    };
-  });
-
-  return result;
-}
-
-function parseUploadObjectName(objectName) {
-  if (!objectName || !objectName.startsWith(UPLOADS_PREFIX)) {
-    return null;
-}
-
-  const remainder = objectName.slice(UPLOADS_PREFIX.length);
-  const [invoiceId, rest] = remainder.split('/', 2);
-  if (!invoiceId || !rest) return null;
-
-  const pageMatch = rest.match(/^page-(\d{1,4})-/i);
-  if (!pageMatch) return null;
-
-  const pageNumber = Number(pageMatch[1]);
-  const originalFilename = rest.slice(pageMatch[0].length);
-
-  return {
-    invoiceId,
-    pageNumber,
-    originalFilename
-  };
-}
-
-async function convertBufferToPdf(buffer, mimeType = 'image/jpeg') {
-  if (mimeType === 'application/pdf') {
-    return buffer;
-  }
-
-  const pdfDoc = await PDFDocument.create();
-  let embeddedImage;
-
-  if (mimeType === 'image/png') {
-    embeddedImage = await pdfDoc.embedPng(buffer);
-  } else {
-    // pdf-lib supports JPEG/JPG via embedJpg; fall back to it for other bitmap formats
-    embeddedImage = await pdfDoc.embedJpg(buffer);
-  }
-
-  const { width, height } = embeddedImage;
-  const page = pdfDoc.addPage([width, height]);
-  page.drawImage(embeddedImage, { x: 0, y: 0, width, height });
-
-  const pdfBytes = await pdfDoc.save();
-  return Buffer.from(pdfBytes);
-}
-
-async function buildCombinedPdfFromPages(pageEntries, defaultBucket) {
-  if (!Array.isArray(pageEntries) || pageEntries.length === 0) {
-    throw new Error('No invoice pages were provided for OCR.');
-  }
-
-  const combinedPdf = await PDFDocument.create();
-  const downloadedPages = [];
-
-  for (const entry of pageEntries) {
-    const bucketName = entry.bucket || defaultBucket;
-    if (!bucketName) {
-      throw new Error(`Missing bucket configuration for page ${entry.pageNumber}`);
-    }
-
-    if (!entry.objectName) {
-      throw new Error(`Missing object name for page ${entry.pageNumber}`);
-    }
-
-    const [buffer] = await storage.bucket(bucketName).file(entry.objectName).download();
-    const mimeType = entry.contentType || 'application/octet-stream';
-    downloadedPages.push({
-      pageNumber: entry.pageNumber,
-      buffer,
-      mimeType,
-      objectName: entry.objectName,
-      bucketName
-    });
-
-    if (mimeType === 'application/pdf') {
-      const pdfDoc = await PDFDocument.load(buffer);
-      const pageIndices = Array.from({ length: pdfDoc.getPageCount() }, (_, index) => index);
-      const copiedPages = await combinedPdf.copyPages(pdfDoc, pageIndices);
-      copiedPages.forEach((page) => combinedPdf.addPage(page));
-      continue;
-    }
-
-    const singlePagePdfBuffer = await convertBufferToPdf(buffer, mimeType);
-    const singlePageDoc = await PDFDocument.load(singlePagePdfBuffer);
-    const [copiedPage] = await combinedPdf.copyPages(singlePageDoc, [0]);
-    combinedPdf.addPage(copiedPage);
-  }
-
-  const combinedBuffer = await combinedPdf.save();
-  return {
-    combinedPdfBuffer: Buffer.from(combinedBuffer),
-    downloadedPages
-  };
-}
-
-async function runInvoiceOcr(pageBuffers) {
-  if (!openaiClient) {
-    console.warn('OPENAI_API_KEY not configured; skipping OCR.');
-    return null;
-  }
-
-  if (!Array.isArray(pageBuffers) || !pageBuffers.length) {
-    console.warn('No page buffers provided for OCR.');
-    return null;
-  }
-
-  let lastError = null;
-  for (let attempt = 1; attempt <= OCR_MAX_RETRIES; attempt++) {
-    try {
-      const result = await runInvoiceOcrAttempt(pageBuffers);
-      if (result) {
-        if (attempt > 1) {
-          console.log(`OCR succeeded on retry attempt ${attempt}.`);
-        }
-        return result;
-      }
-      lastError = new Error('OCR attempt produced no result.');
-      console.warn(`OCR attempt ${attempt} produced no result; retrying...`);
-    } catch (error) {
-      lastError = error;
-      console.error(`OCR attempt ${attempt} failed`, error);
-    }
-  }
-
-  throw lastError || new Error(`Aποτυχία OCR έπειτα από ${OCR_MAX_RETRIES} προσπάθειες`);
-}
-
-async function runInvoiceOcrAttempt(pageBuffers) {
-  const aggregatedText = [];
-  for (const page of pageBuffers) {
-    const mimeType = page.mimeType || 'application/octet-stream';
-    if (mimeType === 'application/pdf') {
-      console.warn(
-        `Skipping PDF page ${page.pageNumber} for Vision OCR; expected image formats.`,
-        { mimeType }
-      );
-      continue;
-    }
-
-    try {
-      const [visionResult] = await visionClient.documentTextDetection({
-        image: { content: page.buffer }
-      });
-      const pageText = visionResult?.fullTextAnnotation?.text?.trim();
-      if (pageText) {
-        aggregatedText.push(`=== PAGE ${page.pageNumber} ===\n${pageText}`);
-      } else {
-        console.warn(`Vision returned empty text for page ${page.pageNumber}`);
-      }
-    } catch (visionError) {
-      console.error('Vision API failed to read invoice text', { mimeType }, visionError);
-      throw visionError;
-    }
-  }
-
-  const ocrText = aggregatedText.join('\n\n');
-  if (!ocrText) {
-    throw new Error('Vision API did not return any text for this invoice.');
-  }
-
-  // Normalize European decimals (2.383,13 → 2383.13) before GPT
-  const fullText = normalizeEuropeanDecimals(ocrText);
-
-
-  const systemPrompt = [
-    'You are an expert accountant and document-analysis specialist for Greek invoices.',
-    'You ALWAYS output strictly valid JSON following the schema provided by the user.',
-    '',
-    'You will be given the FULL multi-page OCR text of a Greek invoice.',
-    'The OCR may be noisy, misordered, or contain junk text from headers, footers, or page numbers.',
-    'The OCR you receive contains multiple pages in the format',
-    '=== PAGE 1 ===',
-    '... page 1 text ...',
-    '=== PAGE 2 ===',
-    '... page 2 text ...',
-    '=== PAGE N ===',
-    '... page N text ...',
-    '',
-    '===========================',
-    'GENERAL EXTRACTION RULES',
-    '===========================',
-    '0. Treat each page independently. Do not mix data from different pages.',
-    '1. Extract ONLY data from the actual invoice content. Ignore:',
-    '   - phone numbers',
-    '   - website URLs',
-    '   - footer disclaimers',
-    '   - repeated totals from intermediate sections',
-    '',
-    '2. Multi-page logic:',
-    '   - Supplier information ALWAYS appears on page 1.',
-    '   - Financial totals (Net, VAT, Payable) ALWAYS appear on the LAST page.',
-    '   - Do NOT mix totals from earlier pages.',
-    '   - If multiple candidates appear, prefer the last page\'s values.',
-    '',
-    '3. Supplier (ΠΡΟΜΗΘΕΥΤΗΣ):',
-    '   - The supplier is the ISSUING company shown in the document header (top area of page 1).',
-    '   - Supplier info typically appears BEFORE any "ΣΤΟΙΧΕΙΑ ΠΕΛΑΤΗ" or "ΣΤΟΙΧΕΙΑ ΑΠΟΣΤΟΛΗΣ" sections.',
-    '   - The supplier block contains: company name/logo, address, phone, ΑΦΜ, ΔΟΥ.',
-    '   - CRITICAL: The supplier name MUST have its own ΑΦΜ (9-digit tax number) directly associated with it.',
-    '   - NEVER confuse supplier with customer. The customer appears AFTER sections like:',
-    '     "ΣΤΟΙΧΕΙΑ ΠΕΛΑΤΗ", "ΕΠΩΝΥΜΙΑ ΠΕΛΑΤΗ", "ΠΕΛΑΤΗΣ", "ΑΠΟΔΕΚΤΗΣ", "ΠΑΡΑΛΗΠΤΗΣ".',
-    '   - CRITICAL EXCLUSION - ERP/SOFTWARE BRANDING:',
-    '     * Greek invoices often show branding from the ERP/invoicing software used to generate them.',
-    '     * These are NOT the supplier. IGNORE any name that appears with a website URL (e.g., https://...).',
-    '     * Common ERP/software companies to EXCLUDE as suppliers:',
-    '       - Epsilon Net, Epsilon Digital, epsilondigital.gr',
-    '       - SoftOne, Soft1, Galaxy',
-    '       - Entersoft, Singular Logic, Atlantis',
-    '       - Papirus, E-invoicing, myDATA',
-    '       - Any name appearing at the bottom of the page near a QR code or URL',
-    '     * The REAL supplier has an ΑΦΜ, ΔΟΥ, physical address - not just a website.',
-    '   - If no name is clearly in the header with associated ΑΦΜ, return null.',
-    '',
-    '4. Supplier TAX ID (ΑΦΜ ΠΡΟΜΗΘΕΥΤΗ):',
-    '   - The supplier ΑΦΜ is the 9-digit number in the document HEADER BLOCK (top of page).',
-    '   - It appears near/below the supplier company name, often with ΔΟΥ nearby.',
-    '   - CRITICAL EXCLUSION RULE:',
-    '     * Scan the OCR text for keywords: "ΣΤΟΙΧΕΙΑ ΠΕΛΑΤΗ", "ΣΤΟΙΧΕΙΑ ΑΠΟΣΤΟΛΗΣ", "ΕΠΩΝΥΜΙΑ ΠΕΛΑΤΗ", "ΠΕΛΑΤΗΣ".',
-    '     * Any ΑΦΜ appearing AFTER these keywords is the CUSTOMER ΑΦΜ - do NOT use it.',
-    '     * Only use an ΑΦΜ that appears BEFORE any customer section.',
-    '   - If there more than 1 ΑΦΜ or Α.Φ.Μ. values, the FIRST one (reading top-to-bottom) is almost always the supplier.',
-    '   - Supplier ΑΦΜ must be exactly 9 digits.',
-    '',
-    '5. Invoice Number (ΑΡΙΘΜΟΣ ΤΙΜΟΛΟΓΙΟΥ):',
-    '   - Look for a table/row with columns: ΣΕΙΡΑ | ΑΡΙΘΜΟΣ | ΗΜΕΡΟΜΗΝΙΑ (or similar).',
-    '   - The invoice number is the value under the "ΑΡΙΘΜΟΣ" column header.',
-    '   - CRITICAL EXCLUSION RULE:',
-    '     * NEVER use numbers from rows labeled "Σχετικά Παραστατικά", "Παραστατικά", or "Αριθ. Παραστ.".',
-    '     * These are reference/related document numbers, NOT the main invoice number.',
-    '   - The invoice number often has 5-7 digits (e.g., 090748) and may include a series prefix.',
-    '   - Accept typical suffixes: ΤΔΑ, Τ-ΔΑ, ΤΙΜ, ΤΙΜΟΛ, INV, ΤΠΥ, etc.',
-    '   - Remove spaces and non-alphanumeric garbage.',
-    '',
-    '6. Date (ΗΜΕΡΟΜΗΝΙΑ):',
-    '   - Must match dd/mm/yyyy or dd-mm-yyyy or yyyy-mm-dd.',
-    '   - If multiple dates appear, choose the one closest to the invoice header.',
-    '',
-    '7. Net Amount (ΚΑΘΑΡΗ ΑΞΙΑ):',
-    '   - Labeled "ΚΑΘΑΡΗ ΑΞΙΑ" or "ΣΥΝΟΛΟ ΧΩΡΙΣ ΦΠΑ" or "ΚΑΘΑΡΗ".',
-    '   - Extract ONLY the final net amount (last page).',
-    '   - The CORRECT final net amount is the one that appears closest to the final payable amount (final amount Labeled "ΠΛΗΡΩΤΕΟ", "ΤΕΛΙΚΟ", "ΣΥΝΟΛΟ", "ΣΥΝΟΛΙΚΟ").',
-    '',
-    '8. VAT Amount (ΦΠΑ):',
-    '   - Labeled "ΦΠΑ", "Φ.Π.Α.", or shows VAT percentage.',
-    '   - Select the final VAT amount (last page).',
-    '   - Must not include the percentage symbol.',
-    '',
-    '9. Payable Amount (ΠΛΗΡΩΤΕΟ):',
-    '   - Labeled "ΠΛΗΡΩΤΕΟ", "ΤΕΛΙΚΟ", "ΣΥΝΟΛΟ", "ΣΥΝΟΛΙΚΟ".',
-    '   - Select the highest valid amount among final totals.',
-    '',
-    '10. Amount formats:',
-    '    - Always return dot-decimal (1234.56).',
-    '    - Never include € symbols.',
-    '',
-    '11. If a field is uncertain or missing, set it to null.',
-    '',
-    '===========================',
-    'ACCURACY FIELD ("ΑΚΡΙΒΕΙΑ")',
-    '===========================',
-    'Return a value 0–100 representing confidence:',
-    '- 100 = all fields clearly present and correctly mapped',
-    '- 60–90 = some ambiguities',
-    '- < 60 = large uncertainty',
-    '',
-    '===========================',
-    'REASONING',
-    '===========================',
-    'Think step-by-step INTERNALLY.',
-    'Do NOT include reasoning in the output.',
-    'Output ONLY the final JSON.'
-  ].join('\n');
-
-  const extractionPrompt =
-    'Παρακάτω σου δίνω ΟΛΟ το κείμενο ενός (πιθανόν πολυσέλιδου) τιμολογίου όπως προέκυψε από OCR.\n\n' +
-    'Εντόπισε και επέστρεψε τα παρακάτω πεδία αυστηρά σε JSON, σύμφωνα με το schema:\n\n' +
-    REQUIRED_FIELDS.map((field, idx) => `${idx + 1}. ${field}`).join('\n') +
-    '\n\n⚠️ ΚΡΙΣΙΜΟΙ ΚΑΝΟΝΕΣ:\n' +
-    '- ΑΦΜ ΠΡΟΜΗΘΕΥΤΗ: Χρησιμοποίησε ΜΟΝΟ το ΑΦΜ που εμφανίζεται ΠΡΙΝ από οποιοδήποτε "ΣΤΟΙΧΕΙΑ ΠΕΛΑΤΗ" ΚΑΙ ΣΤΟΙΧΕΙΑ ΑΠΟΣΤΟΛΗΣ.\n' +
-    'Αν υπάρχουν πανω απο 1 ΑΦΜ, το ΠΡΩΤΟ (από πάνω προς τα κάτω) είναι του προμηθευτή.\n' +
-    '- ΑΡΙΘΜΟΣ ΤΙΜΟΛΟΓΙΟΥ: Χρησιμοποίησε τον αριθμό από τη στήλη "ΑΡΙΘΜΟΣ" (συνήθως δίπλα σε ΣΕΙΡΑ/ΗΜΕΡΟΜΗΝΙΑ). ' +
-    'ΠΟΤΕ μην χρησιμοποιήσεις αριθμούς από "Σχετικά Παραστατικά" - αυτοί είναι αριθμοί αναφοράς.\n' +
-    '\nΘυμήσου:\n' +
-    '- Ο προμηθευτής βρίσκεται μόνο στην πρώτη σελίδα, στην κορυφή της σελίδας.\n' +
-    '- ΠΡΟΣΟΧΗ: Αγνόησε ονόματα εταιρειών ERP/λογισμικού (π.χ. Epsilon Net, SoftOne, Galaxy, Entersoft) - αυτές ΔΕΝ είναι ο προμηθευτής.\n' +
-    '- Ο ΠΡΑΓΜΑΤΙΚΟΣ προμηθευτής έχει δικό του ΑΦΜ, ΔΟΥ και διεύθυνση - όχι απλώς URL ιστοσελίδας.\n' +
-    '- Τα οικονομικά σύνολα βρίσκονται μόνο στην τελευταία σελίδα.\n' +
-    '- Αν κάποιο πεδίο δεν είναι βέβαιο, βάλε null.\n' +
-    '- Χρησιμοποίησε δεκαδικό με τελεία.\n\n' +
-    'Ακολουθεί το κείμενο του τιμολογίου:\n\n' +
-    fullText;
-    
-
-  const response = await openaiClient.responses.create({
-    model: 'gpt-4o-mini',
-    input: [
-      {
-        role: 'system',
-        content: [{ type: 'input_text', text: systemPrompt }]
-      },
-      {
-        role: 'user',
-        content: [
-          { type: 'input_text', text: extractionPrompt }
-        ]
-      }
-    ],
-    text: {
-      format: {
-        type: 'json_schema',
-        name: 'greek_invoice_ocr_format',
-        schema: {
-          type: 'object',
-          additionalProperties: false,
-          properties: {
-            'ΗΜΕΡΟΜΗΝΙΑ': { type: ['string', 'null'] },
-            'ΑΡΙΘΜΟΣ ΤΙΜΟΛΟΓΙΟΥ': { type: ['string', 'null'] },
-            'ΑΦΜ ΠΡΟΜΗΘΕΥΤΗ': { type: ['string', 'null'] },
-            'ΠΡΟΜΗΘΕΥΤΗΣ': { type: ['string', 'null'] },
-            'ΚΑΘΑΡΗ ΑΞΙΑ': { type: ['string', 'null'] },
-            'ΦΠΑ': { type: ['string', 'null'] },
-            'ΠΛΗΡΩΤΕΟ': { type: ['string', 'null'] },
-            'ΑΚΡΙΒΕΙΑ': { type: ['string', 'null'] }
-          },
-          required: REQUIRED_FIELDS
-        },
-        strict: true
-      }
-    },
-    max_output_tokens: 800
-  });
-
-  const rawText = collectResponseText(response);
-  return parseJsonFromResponse(rawText);
-}
-
-//exports.getSignedUploadUrl = functions.region('europe-west8').https.onRequest(async (req, res) => {
-exports.getSignedUploadUrl = functions
-  .region(REGION)
-  .runWith(FUNCTION_OPTIONS)
-  .https.onRequest(async (req, res) => {
-  res.set('Access-Control-Allow-Origin', '*');
-  res.set('Access-Control-Allow-Headers', 'Authorization, Content-Type');
-  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
-
-  if (req.method === 'OPTIONS') {
-    return res.status(204).send('');
-  }
-
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' });
-  }
+import {
+  admin,
+  db,
+  storage,
+  REGION,
+  SERVICE_ACCOUNT_EMAIL,
+  GCS_BUCKET,
+  UPLOADS_PREFIX,
+  METADATA_INVOICE_COLLECTION,
+  SIGNED_URL_TTL_MS,
+  PAYMENT_STATUS,
+  serverTimestamp,
+  getBucketName,
+  getAthensToday,
+} from './lib/config.js';
+
+import { authenticateRequest, getUserDisplayName } from './lib/auth.js';
+import { HTTP_OPTS, requireMethod, sendError } from './lib/http-utils.js';
+
+import {
+  sanitizeFilename,
+  normalizeTotalPages,
+  normalizePageNumber,
+  padPageNumber,
+  ensureInvoiceDocument,
+  registerUploadedPage,
+  parseUploadObjectName,
+} from './lib/invoice-upload.js';
+
+import { processInvoiceDocumentHandler } from './lib/invoice-processor.js';
+
+import { validatePaymentRequest, derivePaymentStatus, validateUpdateFieldsRequest } from './lib/payments.js';
+
+import { validateUpdateSupplierRequest } from './lib/suppliers.js';
+
+import {
+  FINANCIAL_ENTRIES_COLLECTION,
+  RECURRING_EXPENSES_COLLECTION,
+  ENTRY_TYPE,
+  ENTRY_SOURCE,
+  EXPENSE_CATEGORY,
+  VALID_INCOME_CATEGORIES,
+  VALID_EXPENSE_CATEGORIES,
+  validateFinancialEntryRequest,
+  validateUpdateFinancialEntryRequest,
+  buildFinancialEntry,
+} from './lib/financial.js';
+
+import { validateRecurringExpenseRequest } from './lib/recurring.js';
+
+import {
+  validateExportRequest,
+  fetchInvoiceDocuments,
+  recordDownloads,
+  streamInvoicesZip,
+  getExportDownloadUrl,
+} from './lib/invoice-export.js';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SIGNED UPLOAD URL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Blue-green deployment: v2 functions run alongside v1
+// Old function name: getSignedUploadUrl
+export const getSignedUploadUrl_v2 = onRequest(HTTP_OPTS, async (req, res) => {
+  if (!requireMethod(req, res, 'POST')) return;
 
   const bucketName = getBucketName();
   if (!bucketName) {
-    return res.status(500).json({ error: 'Missing GCS bucket configuration' });
+    return sendError(res, 500, 'Missing GCS bucket configuration');
   }
 
-  const idToken = extractBearerToken(req.header('Authorization'));
-  if (!idToken) {
-    return res.status(401).json({ error: 'Missing Authorization: Bearer <token>' });
+  const authResult = await authenticateRequest(req);
+  if (authResult.error) {
+    return sendError(res, authResult.status, authResult.error);
   }
-
-  let decoded;
-  try {
-    decoded = await admin.auth().verifyIdToken(idToken);
-  } catch (error) {
-    return res.status(401).json({
-      error: 'Invalid or expired Firebase ID token',
-      details: error.message
-    });
-  }
+  const decoded = authResult.user;
 
   const {
     filename,
     contentType = 'application/octet-stream',
     invoiceId,
     pageNumber,
-    totalPages = null
+    totalPages = null,
   } = req.body || {};
 
   if (!filename) {
-    return res.status(400).json({ error: 'filename is required in the request body' });
+    return sendError(res, 400, 'filename is required in the request body');
   }
 
   try {
@@ -858,8 +105,9 @@ exports.getSignedUploadUrl = functions
     const invoiceMetadata = await ensureInvoiceDocument({
       invoiceId,
       uid: decoded.uid,
+      userName: getUserDisplayName(decoded),
       bucketName,
-      totalPages: normalizedTotalPages
+      totalPages: normalizedTotalPages,
     });
     const resolvedInvoiceId = invoiceMetadata.invoiceId;
     const resolvedTotalPages = invoiceMetadata.totalPages || normalizedTotalPages;
@@ -871,15 +119,12 @@ exports.getSignedUploadUrl = functions
     )}-${sanitizedFilename}`;
     const expiresAtMs = Date.now() + SIGNED_URL_TTL_MS;
 
-    const [signedUrl] = await storage
-      .bucket(bucketName)
-      .file(objectName)
-      .getSignedUrl({
-        version: 'v4',
-        action: 'write',
-        expires: expiresAtMs,
-        contentType
-      });
+    const [signedUrl] = await storage.bucket(bucketName).file(objectName).getSignedUrl({
+      version: 'v4',
+      action: 'write',
+      expires: expiresAtMs,
+      contentType,
+    });
 
     return res.json({
       invoiceId: resolvedInvoiceId,
@@ -889,324 +134,75 @@ exports.getSignedUploadUrl = functions
       bucket: bucketName,
       objectName,
       contentType,
-      expiresAt: new Date(expiresAtMs).toISOString()
+      expiresAt: new Date(expiresAtMs).toISOString(),
     });
   } catch (error) {
     console.error('Failed to create signed URL:', error);
-    return res.status(400).json({ error: error.message });
+    return sendError(res, error.httpStatus || 500, error.message);
   }
 });
 
-exports.processUploadedInvoice = functions
-  .region(REGION)
-  .runWith(FUNCTION_OPTIONS)
-  .storage.object()
-  .onFinalize(async (object) => {
-  const { name: objectName, bucket, contentType } = object;
-  if (!objectName) {
-    console.warn('Finalize event missing object name');
-    return;
-  }
+// ═══════════════════════════════════════════════════════════════════════════════
+// PROCESS UPLOADED INVOICE (Storage trigger)
+// ═══════════════════════════════════════════════════════════════════════════════
 
-  if (!objectName.startsWith(UPLOADS_PREFIX)) {
-    console.log(`Skipping ${objectName} because it is outside ${UPLOADS_PREFIX}`);
-    return;
-  }
+// Blue-green deployment: v2 functions run alongside v1
+// Old function name: processUploadedInvoice
+export const processUploadedInvoice_v2 = onObjectFinalized(
+  {
+    region: REGION,
+    serviceAccount: SERVICE_ACCOUNT_EMAIL,
+    bucket: GCS_BUCKET,
+  },
+  async (event) => {
+    const object = event.data;
+    const { name: objectName, bucket, contentType } = object;
 
-  const parsed = parseUploadObjectName(objectName);
-  if (!parsed) {
-    console.warn(`Unable to parse invoice metadata from object name: ${objectName}`);
-    return;
-  }
-
-  try {
-    await registerUploadedPage({
-      invoiceId: parsed.invoiceId,
-      pageNumber: parsed.pageNumber,
-      objectName,
-      bucketName: bucket,
-      contentType: contentType || 'application/octet-stream'
-    });
-    console.log(
-      `Registered page ${parsed.pageNumber} for invoice ${parsed.invoiceId} (${objectName})`
-    );
-  } catch (error) {
-    console.error(
-      `Failed to register page ${parsed.pageNumber} for invoice ${parsed.invoiceId}`,
-      error
-    );
-  }
-});
-
-exports.processInvoiceDocument = functions
-  .region(REGION)
-  .runWith(FUNCTION_OPTIONS)
-  .firestore.document(`${METADATA_INVOICE_COLLECTION}/{invoiceId}`)
-  .onWrite(async (change, context) => {
-    const after = change.after.exists ? change.after.data() : null;
-    if (!after) {
+    if (!objectName) {
+      console.warn('Finalize event missing object name');
       return;
     }
 
-    const before = change.before.exists ? change.before.data() : null;
-    if (before && before.status === after.status) {
+    if (!objectName.startsWith(UPLOADS_PREFIX)) {
+      console.log(`Skipping ${objectName} because it is outside ${UPLOADS_PREFIX}`);
       return;
     }
 
-    if (after.status !== INVOICE_STATUS.ready) {
+    const parsed = parseUploadObjectName(objectName);
+    if (!parsed) {
+      console.warn(`Unable to parse invoice metadata from object name: ${objectName}`);
       return;
     }
-
-    if (!openaiClient) {
-      console.warn('OPENAI_API_KEY not configured; unable to run OCR.');
-      await change.after.ref.update({
-        status: INVOICE_STATUS.error,
-        errorMessage: 'Αποτυχία OCR, το OPENAI_API_KEY λείπει.',
-        updatedAt: serverTimestamp()
-      });
-      return;
-    }
-
-    let lockedSnapshot;
-    try {
-      lockedSnapshot = await db.runTransaction(async (tx) => {
-        const lockedSnap = await tx.get(change.after.ref);
-        const lockedData = lockedSnap.data();
-        if (lockedData.status !== INVOICE_STATUS.ready) {
-          return null;
-        }
-
-        tx.update(change.after.ref, {
-          status: INVOICE_STATUS.processing,
-          processingStartedAt: serverTimestamp(),
-          errorMessage: null,
-          updatedAt: serverTimestamp()
-        });
-
-        return lockedData;
-      });
-    } catch (error) {
-      console.error('Failed to lock invoice document for processing', error);
-      return;
-    }
-
-    if (!lockedSnapshot) {
-      return;
-    }
-
-    const invoiceId = context.params.invoiceId;
-    const invoiceData = lockedSnapshot;
-    const bucketName = invoiceData.bucket || getBucketName();
-    if (!bucketName) {
-      await change.after.ref.update({
-        status: INVOICE_STATUS.error,
-        errorMessage: 'Λείπει η ρύθμιση του bucket για την επεξεργασία τιμολογίου.',
-        updatedAt: serverTimestamp()
-      });
-      return;
-    }
-
-    const pages = Array.isArray(invoiceData.pages)
-      ? [...invoiceData.pages].sort((a, b) => a.pageNumber - b.pageNumber)
-      : [];
-
-    if (!pages.length) {
-      await change.after.ref.update({
-        status: INVOICE_STATUS.error,
-        errorMessage: 'Δεν έγινε ανέβασμα τιμολογίου.',
-        updatedAt: serverTimestamp()
-      });
-      return;
-    }
-
-    if (invoiceData.totalPages && pages.length !== invoiceData.totalPages) {
-      await change.after.ref.update({
-        status: INVOICE_STATUS.error,
-        errorMessage: `Αναμενόταν ${invoiceData.totalPages} σελίδες αλλά βρέθηκαν ${pages.length}.`,
-        updatedAt: serverTimestamp()
-      });
-      return;
-    }
-
-    // Declare outside try block so they're accessible in catch for error formatting
-    let supplierName = null;
-    let invoiceNumber = null;
 
     try {
-      const { combinedPdfBuffer, downloadedPages } = await buildCombinedPdfFromPages(
-        pages,
-        bucketName
-      );
-
-      // At this stage of the app, in order to avoid noise and extra charges from the Vision API
-      // and GPT, we will only OCR the first and last page of the invoice 
-      // since the supplier info, invoice number, date are on the first page 
-      // and the totals, amounts are on the last page. (MVP)
-      // For invoices with more than 2 pages, OCR only first and last page
-      // Page 1 = supplier info, invoice number, date
-      // Page N = totals, amounts
-      let pagesToOcr = downloadedPages;
-      if (downloadedPages.length > 2) {
-        const sortedPages = [...downloadedPages].sort((a, b) => a.pageNumber - b.pageNumber);
-        const firstPage = sortedPages[0];
-        const lastPage = sortedPages[sortedPages.length - 1];
-        pagesToOcr = [firstPage, lastPage];
-        console.log(
-          `Invoice has ${downloadedPages.length} pages; OCR will process only page ${firstPage.pageNumber} and page ${lastPage.pageNumber}`
-        );
-      }
-
-      const ocrResult = await runInvoiceOcr(pagesToOcr);
-      if (!ocrResult) {
-        throw new Error('OCR result was empty.');
-      }
-
-      const mappedResult = Object.entries(ocrResult).reduce((acc, [key, value]) => {
-        const englishKey = FIELD_LABELS[key] || key;
-        acc[englishKey] = value;
-        return acc;
-      }, {});
-
-      console.log('OCR extraction (GR):', JSON.stringify(ocrResult, null, 2));
-      console.log('OCR extraction (EN):', JSON.stringify(mappedResult, null, 2));
-
-      supplierName = mappedResult.supplierName || 'Unknown Supplier';
-      const supplierTaxNumber = mappedResult.supplierTaxNumber || null;
-      const supplierId = sanitizeId(
-        supplierTaxNumber,
-        sanitizeId(supplierName, 'unknown-supplier')
-      );
-      invoiceNumber = mappedResult.invoiceNumber?.toString().match(/\d+/g)?.join('') || null;
-      const uploadedBy = invoiceData.ownerUid || null;
-      await ensureSupplierProfile({
-        supplierId,
-        supplierName,
-        supplierTaxNumber,
-        supplierCategory: mappedResult.supplierCategory || null
+      await registerUploadedPage({
+        invoiceId: parsed.invoiceId,
+        pageNumber: parsed.pageNumber,
+        objectName,
+        bucketName: bucket,
+        contentType: contentType || 'application/octet-stream',
       });
-
-      // Check for duplicate invoice (same supplier + invoice number, only against done invoices)
-      if (invoiceNumber && supplierId) {
-        const duplicateQuery = await db
-          .collection('suppliers')
-          .doc(supplierId)
-          .collection('invoices')
-          .where('invoiceNumber', '==', invoiceNumber)
-          .where('processingStatus', '==', INVOICE_STATUS.uploaded)
-          .limit(1)
-          .get();
-
-        if (!duplicateQuery.empty) {
-          const existingInvoice = duplicateQuery.docs[0];
-          const baseError = `Διπλότυπο τιμολόγιο (υπάρχον: ${existingInvoice.id})`;
-          const errorMessage = formatMetadataError(invoiceNumber, supplierName, baseError);
-          
-          console.error(errorMessage);
-          
-          await change.after.ref.update({
-            status: INVOICE_STATUS.error,
-            errorMessage,
-            duplicateOf: existingInvoice.id,
-            detectedInvoiceNumber: invoiceNumber,
-            detectedSupplierId: supplierId,
-            updatedAt: serverTimestamp()
-          });
-
-          return;
-        }
-      }
-
-      const pdfObjectPath = `suppliers/${supplierId}/invoices/${invoiceId}.pdf`;
-      try {
-        await storage
-          .bucket(bucketName)
-          .file(pdfObjectPath)
-          .save(combinedPdfBuffer, {
-            resumable: false,
-            contentType: 'application/pdf',
-            metadata: {
-              pages: pages.length,
-              originalFolder: invoiceData.storageFolder || `${UPLOADS_PREFIX}${invoiceId}`
-            }
-          });
-        console.log(`Stored normalized PDF at gs://${bucketName}/${pdfObjectPath}`);
-      } catch (pdfError) {
-        console.error(`Failed to store combined PDF for invoice ${invoiceId}:`, pdfError);
-      }
-
-      const invoiceDocRef = db.doc(`suppliers/${supplierId}/invoices/${invoiceId}`);
-      
-      // Store original OCR data for reference when user edits fields
-      const ocrData = {
-        supplierName,
-        supplierTaxNumber,
-        invoiceNumber,
-        invoiceDate: mappedResult.invoiceDate || null,
-        dueDate: mappedResult.dueDate || null,
-        totalAmount: mappedResult.totalAmount || null,
-        currency: mappedResult.currency || 'EUR',
-        netAmount: mappedResult.netAmount || null,
-        vatAmount: mappedResult.vat || null,
-        vatRate: mappedResult.vatRate || null,
-        confidence: mappedResult.confidence ? Number(mappedResult.confidence) : null,
-        extractedAt: admin.firestore.Timestamp.now()
-      };
-
-      const invoicePayload = {
-        invoiceId,
-        rawFilePaths: pages.map((p) => p.objectName),
-        filePath: pdfObjectPath,
-        bucket: bucketName,
-        uploadedBy,
-        supplierId,
-        supplierName,
-        supplierTaxNumber,
-        invoiceNumber,
-        invoiceDate: parseDate(mappedResult.invoiceDate),
-        dueDate: parseDate(mappedResult.dueDate),
-        totalAmount: parseAmount(mappedResult.totalAmount),
-        currency: mappedResult.currency || 'EUR',
-        netAmount: parseAmount(mappedResult.netAmount),
-        vatAmount: parseAmount(mappedResult.vat),
-        vatRate: parseAmount(mappedResult.vatRate),
-        processingStatus: INVOICE_STATUS.uploaded,
-        paymentStatus: PAYMENT_STATUS.unpaid,
-        unpaidAmount: parseAmount(mappedResult.totalAmount),
-        errorMessage: null,
-        confidence: mappedResult.confidence ? Number(mappedResult.confidence) : null,
-        ocr: ocrData,
-        createdAt: invoiceData.createdAt || serverTimestamp(),
-        uploadedAt: serverTimestamp()
-      };
-
-      await invoiceDocRef.set(invoicePayload, { merge: true });
-
-      await change.after.ref.update({
-        status: INVOICE_STATUS.done,
-        uploadedAt: serverTimestamp(),
-        processedInvoicePath: invoiceDocRef.path,
-        confidence: invoicePayload.confidence,
-        errorMessage: null,
-        successMessage: formatMetadataSuccess(invoiceNumber, supplierName),
-        updatedAt: serverTimestamp()
-      });
-
-      console.log(`Stored invoice data at ${invoiceDocRef.path}`);
-
-      // TODO: send notification on success
+      console.log(`Registered page ${parsed.pageNumber} for invoice ${parsed.invoiceId} (${objectName})`);
     } catch (error) {
-      const baseError = `Αδυναμία επεξεργασίας τιμολογίου με id: ${invoiceId}. Σφάλμα: ${error.message}`;
-      const errorMessage = formatMetadataError(invoiceNumber, supplierName, baseError);
-      console.error(errorMessage);
-      await change.after.ref.update({
-        status: INVOICE_STATUS.error,
-        errorMessage,
-        updatedAt: serverTimestamp()
-      });
-
-      // TODO: send notification on error
+      console.error(`Failed to register page ${parsed.pageNumber} for invoice ${parsed.invoiceId}`, error);
     }
-  });
+  }
+);
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PROCESS INVOICE DOCUMENT (Firestore trigger)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Blue-green deployment: v2 functions run alongside v1
+// Old function name: processInvoiceDocument
+export const processInvoiceDocument_v2 = onDocumentWritten(
+  {
+    region: REGION,
+    serviceAccount: SERVICE_ACCOUNT_EMAIL,
+    document: `${METADATA_INVOICE_COLLECTION}/{invoiceId}`,
+  },
+  processInvoiceDocumentHandler
+);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // PAYMENT STATUS UPDATE FUNCTION
@@ -1232,273 +228,166 @@ exports.processInvoiceDocument = functions
 // - Atomic updates via Firestore transaction
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/**
- * Validates and extracts the authenticated user from the request
- */
-async function authenticateRequest(req) {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return { error: 'Missing or invalid Authorization header', status: 401 };
+// Blue-green deployment: v2 functions run alongside v1
+// Old function name: updatePaymentStatus
+export const updatePaymentStatus_v2 = onRequest(HTTP_OPTS, async (req, res) => {
+  if (!requireMethod(req, res, 'POST')) return;
+
+  // 1. Authenticate
+  const authResult = await authenticateRequest(req);
+  if (authResult.error) {
+    return sendError(res, authResult.status, authResult.error);
+  }
+  const user = authResult.user;
+
+  // 2. Validate request body
+  const body = req.body || {};
+  const validationErrors = validatePaymentRequest(body);
+  if (validationErrors.length > 0) {
+    return sendError(res, 400, 'Validation failed', { details: validationErrors });
   }
 
-  const idToken = authHeader.split('Bearer ')[1];
+  const { supplierId, invoiceId, action, paymentMethod, notes } = body;
+  const paymentDate = body.paymentDate
+    ? admin.firestore.Timestamp.fromDate(new Date(body.paymentDate))
+    : admin.firestore.FieldValue.serverTimestamp();
+
+  const invoiceRef = db.collection('suppliers').doc(supplierId).collection('invoices').doc(invoiceId);
+
   try {
-    const decodedToken = await admin.auth().verifyIdToken(idToken);
-    return { user: decodedToken };
-  } catch (error) {
-    console.error('Token verification failed:', error);
-    return { error: 'Invalid or expired token', status: 401 };
-  }
-}
+    const result = await db.runTransaction(async (tx) => {
+      const invoiceSnap = await tx.get(invoiceRef);
 
-/**
- * Validates payment request body
- */
-function validatePaymentRequest(body) {
-  const errors = [];
-
-  if (!body.supplierId || typeof body.supplierId !== 'string') {
-    errors.push('supplierId is required and must be a string');
-  }
-
-  if (!body.invoiceId || typeof body.invoiceId !== 'string') {
-    errors.push('invoiceId is required and must be a string');
-  }
-
-  if (!['pay', 'partial'].includes(body.action)) {
-    errors.push('action must be "pay" or "partial"');
-  }
-
-  if (body.action === 'partial') {
-    if (typeof body.amount !== 'number' || body.amount <= 0) {
-      errors.push('amount is required and must be a positive number for partial payments');
-    }
-  }
-
-  if (body.amount !== undefined && (typeof body.amount !== 'number' || body.amount < 0)) {
-    errors.push('amount must be a non-negative number');
-  }
-
-  if (body.paymentDate) {
-    const date = new Date(body.paymentDate);
-    if (isNaN(date.getTime())) {
-      errors.push('paymentDate must be a valid ISO date string');
-    }
-  }
-
-  if (body.notes && typeof body.notes !== 'string') {
-    errors.push('notes must be a string');
-  }
-
-  return errors;
-}
-
-/**
- * Derives payment status from amounts
- */
-function derivePaymentStatus(paidAmount, totalAmount) {
-  if (!totalAmount || totalAmount <= 0) {
-    // If totalAmount is unknown, we can't determine status accurately
-    return paidAmount > 0 ? PAYMENT_STATUS.partiallyPaid : PAYMENT_STATUS.unpaid;
-  }
-
-  if (paidAmount >= totalAmount) {
-    return PAYMENT_STATUS.paid;
-  }
-  if (paidAmount > 0) {
-    return PAYMENT_STATUS.partiallyPaid;
-  }
-  return PAYMENT_STATUS.unpaid;
-}
-
-exports.updatePaymentStatus = functions
-  .region(REGION)
-  .runWith(FUNCTION_OPTIONS)
-  .https.onRequest(async (req, res) => {
-    // CORS headers
-    res.set('Access-Control-Allow-Origin', '*');
-    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-
-    if (req.method === 'OPTIONS') {
-      return res.status(204).send('');
-    }
-
-    if (req.method !== 'POST') {
-      return res.status(405).json({ error: 'Method not allowed. Use POST.' });
-    }
-
-    // 1. Authenticate
-    const authResult = await authenticateRequest(req);
-    if (authResult.error) {
-      return res.status(authResult.status).json({ error: authResult.error });
-    }
-    const user = authResult.user;
-
-    // 2. Validate request body
-    const body = req.body || {};
-    const validationErrors = validatePaymentRequest(body);
-    if (validationErrors.length > 0) {
-      return res.status(400).json({ 
-        error: 'Validation failed', 
-        details: validationErrors 
-      });
-    }
-
-    const { supplierId, invoiceId, action, paymentMethod, notes } = body;
-    const paymentDate = body.paymentDate 
-      ? admin.firestore.Timestamp.fromDate(new Date(body.paymentDate))
-      : admin.firestore.FieldValue.serverTimestamp();
-
-    const invoiceRef = db
-      .collection('suppliers')
-      .doc(supplierId)
-      .collection('invoices')
-      .doc(invoiceId);
-
-    try {
-      const result = await db.runTransaction(async (tx) => {
-        const invoiceSnap = await tx.get(invoiceRef);
-
-        // 3. Check invoice exists
-        if (!invoiceSnap.exists) {
-          throw Object.assign(
-            new Error(`Invoice not found: suppliers/${supplierId}/invoices/${invoiceId}`),
-            { httpStatus: 404 }
-          );
-        }
-
-        const invoiceData = invoiceSnap.data();
-
-        // 4. Authorization check - only owner can update
-        if (invoiceData.uploadedBy && invoiceData.uploadedBy !== user.uid) {
-          throw Object.assign(
-            new Error('You are not authorized to update this invoice'),
-            { httpStatus: 403 }
-          );
-        }
-
-        // 5. Get current payment state
-        const totalAmount = invoiceData.totalAmount || 0;
-        const currentPaidAmount = invoiceData.paidAmount || 0;
-        const currentUnpaidAmount = totalAmount - currentPaidAmount;
-
-        // 6. Calculate payment amount
-        let paymentAmount;
-        if (action === 'pay') {
-          // Full payment - pay remaining balance
-          paymentAmount = body.amount !== undefined ? body.amount : currentUnpaidAmount;
-        } else {
-          // Partial payment - use specified amount
-          paymentAmount = body.amount;
-        }
-
-        // 7. Validate payment doesn't exceed remaining balance
-        if (totalAmount > 0 && paymentAmount > currentUnpaidAmount + 0.01) {
-          throw Object.assign(
-            new Error(
-              `Payment amount (${paymentAmount.toFixed(2)}) exceeds unpaid balance (${currentUnpaidAmount.toFixed(2)})`
-            ),
-            { httpStatus: 400 }
-          );
-        }
-
-        // 8. Validate not already fully paid
-        if (invoiceData.paymentStatus === PAYMENT_STATUS.paid) {
-          throw Object.assign(
-            new Error('Invoice is already fully paid'),
-            { httpStatus: 400 }
-          );
-        }
-
-        // 9. Calculate new amounts
-        const newPaidAmount = currentPaidAmount + paymentAmount;
-        const newUnpaidAmount = Math.max(0, totalAmount - newPaidAmount);
-        const newPaymentStatus = derivePaymentStatus(newPaidAmount, totalAmount);
-
-        // 10. Build payment history entry
-        const paymentEntry = {
-          amount: paymentAmount,
-          paymentDate,
-          paymentMethod: paymentMethod || 'other',
-          notes: notes || null,
-          recordedAt: admin.firestore.Timestamp.now(),
-          recordedBy: user.uid
-        };
-
-        // 11. Update invoice document
-        tx.update(invoiceRef, {
-          paymentStatus: newPaymentStatus,
-          paidAmount: newPaidAmount,
-          unpaidAmount: newUnpaidAmount,
-          lastPaymentAt: admin.firestore.FieldValue.serverTimestamp(),
-          paymentHistory: admin.firestore.FieldValue.arrayUnion(paymentEntry),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      // 3. Check invoice exists
+      if (!invoiceSnap.exists) {
+        throw Object.assign(new Error(`Invoice not found: suppliers/${supplierId}/invoices/${invoiceId}`), {
+          httpStatus: 404,
         });
-
-        return {
-          invoiceId,
-          supplierId,
-          supplierName: invoiceData.supplierName || null,
-          invoiceNumber: invoiceData.invoiceNumber || null,
-          previousStatus: invoiceData.paymentStatus || PAYMENT_STATUS.unpaid,
-          newStatus: newPaymentStatus,
-          paymentAmount,
-          paymentDate,
-          totalAmount,
-          paidAmount: newPaidAmount,
-          unpaidAmount: newUnpaidAmount
-        };
-      });
-
-      console.log(`Payment recorded for invoice ${invoiceId}:`, result);
-
-      // Auto-create expense entry for the payment
-      try {
-        const expenseEntry = {
-          type: ENTRY_TYPE.expense,
-          category: EXPENSE_CATEGORY.invoicePayment,
-          amount: result.paymentAmount,
-          date: result.paymentDate,
-          description: `Τιμολόγιο #${result.invoiceNumber || invoiceId} - ${result.supplierName || supplierId}`,
-          source: ENTRY_SOURCE.invoicePayment,
-          metadata: {
-            invoiceId,
-            supplierId,
-            supplierName: result.supplierName,
-            invoiceNumber: result.invoiceNumber
-          },
-          isDeleted: false,
-          createdBy: user.uid,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp()
-        };
-
-        const expenseRef = await db.collection(FINANCIAL_ENTRIES_COLLECTION).add(expenseEntry);
-        console.log(`Auto-created expense entry ${expenseRef.id} for invoice payment`);
-      } catch (expenseError) {
-        // Log but don't fail the payment - expense creation is secondary
-        console.error('Failed to auto-create expense entry for payment:', expenseError);
       }
 
-      return res.status(200).json({
-        success: true,
-        message: result.newStatus === PAYMENT_STATUS.paid 
-          ? 'Invoice marked as fully paid' 
-          : `Partial payment of ${result.paymentAmount.toFixed(2)} recorded`,
-        data: result
+      const invoiceData = invoiceSnap.data();
+
+      // 4. Authorization check - only owner can update
+      if (invoiceData.uploadedBy && invoiceData.uploadedBy !== user.uid) {
+        throw Object.assign(new Error('You are not authorized to update this invoice'), { httpStatus: 403 });
+      }
+
+      // 5. Get current payment state
+      const totalAmount = invoiceData.totalAmount || 0;
+      const currentPaidAmount = invoiceData.paidAmount || 0;
+      const currentUnpaidAmount = totalAmount - currentPaidAmount;
+
+      // 6. Calculate payment amount
+      let paymentAmount;
+      if (action === 'pay') {
+        // Full payment - pay remaining balance
+        paymentAmount = body.amount !== undefined ? body.amount : currentUnpaidAmount;
+      } else {
+        // Partial payment - use specified amount
+        paymentAmount = body.amount;
+      }
+
+      // 7. Validate payment doesn't exceed remaining balance
+      if (totalAmount > 0 && paymentAmount > currentUnpaidAmount + 0.01) {
+        throw Object.assign(
+          new Error(
+            `Payment amount (${paymentAmount.toFixed(2)}) exceeds unpaid balance (${currentUnpaidAmount.toFixed(2)})`
+          ),
+          { httpStatus: 400 }
+        );
+      }
+
+      // 8. Validate not already fully paid
+      if (invoiceData.paymentStatus === PAYMENT_STATUS.paid) {
+        throw Object.assign(new Error('Invoice is already fully paid'), { httpStatus: 400 });
+      }
+
+      // 9. Calculate new amounts
+      const newPaidAmount = currentPaidAmount + paymentAmount;
+      const newUnpaidAmount = Math.max(0, totalAmount - newPaidAmount);
+      const newPaymentStatus = derivePaymentStatus(newPaidAmount, totalAmount);
+
+      // 10. Build payment history entry
+      const paymentEntry = {
+        amount: paymentAmount,
+        paymentDate,
+        paymentMethod: paymentMethod || 'other',
+        notes: notes || null,
+        recordedAt: admin.firestore.Timestamp.now(),
+        recordedBy: user.uid,
+        recordedByName: getUserDisplayName(user),
+      };
+
+      // 11. Update invoice document
+      tx.update(invoiceRef, {
+        paymentStatus: newPaymentStatus,
+        paidAmount: newPaidAmount,
+        unpaidAmount: newUnpaidAmount,
+        lastPaymentAt: admin.firestore.FieldValue.serverTimestamp(),
+        paymentHistory: admin.firestore.FieldValue.arrayUnion(paymentEntry),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
 
-    } catch (error) {
-      console.error('Payment update failed:', error);
+      return {
+        invoiceId,
+        supplierId,
+        supplierName: invoiceData.supplierName || null,
+        invoiceNumber: invoiceData.invoiceNumber || null,
+        previousStatus: invoiceData.paymentStatus || PAYMENT_STATUS.unpaid,
+        newStatus: newPaymentStatus,
+        paymentAmount,
+        paymentDate,
+        totalAmount,
+        paidAmount: newPaidAmount,
+        unpaidAmount: newUnpaidAmount,
+      };
+    });
 
-      const httpStatus = error.httpStatus || 500;
-      return res.status(httpStatus).json({
-        error: error.message,
-        code: httpStatus === 500 ? 'INTERNAL_ERROR' : 'PAYMENT_ERROR'
-      });
+    console.log(`Payment recorded for invoice ${invoiceId}:`, result);
+
+    // Auto-create expense entry for the payment
+    try {
+      const expenseEntry = {
+        type: ENTRY_TYPE.expense,
+        category: EXPENSE_CATEGORY.invoicePayment,
+        amount: result.paymentAmount,
+        date: result.paymentDate,
+        description: `Τιμολόγιο #${result.invoiceNumber || invoiceId} - ${result.supplierName || supplierId}`,
+        source: ENTRY_SOURCE.invoicePayment,
+        metadata: {
+          invoiceId,
+          supplierId,
+          supplierName: result.supplierName,
+          invoiceNumber: result.invoiceNumber,
+        },
+        isDeleted: false,
+        createdBy: user.uid,
+        createdByName: getUserDisplayName(user),
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      };
+
+      const expenseRef = await db.collection(FINANCIAL_ENTRIES_COLLECTION).add(expenseEntry);
+      console.log(`Auto-created expense entry ${expenseRef.id} for invoice payment`);
+    } catch (expenseError) {
+      // Log but don't fail the payment - expense creation is secondary
+      console.error('Failed to auto-create expense entry for payment:', expenseError);
     }
-  });
+
+    return res.status(200).json({
+      success: true,
+      message:
+        result.newStatus === PAYMENT_STATUS.paid
+          ? 'Invoice marked as fully paid'
+          : `Partial payment of ${result.paymentAmount.toFixed(2)} recorded`,
+      data: result,
+    });
+  } catch (error) {
+    console.error('Payment update failed:', error);
+    const httpStatus = error.httpStatus || 500;
+    return sendError(res, httpStatus, error.message, { code: httpStatus === 500 ? 'INTERNAL_ERROR' : 'PAYMENT_ERROR' });
+  }
+});
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // UPDATE INVOICE FIELDS
@@ -1530,268 +419,157 @@ exports.updatePaymentStatus = functions
 // - Atomic updates via Firestore transaction
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// Allowed fields that can be edited by the user
-const EDITABLE_INVOICE_FIELDS = [
-  'supplierName',
-  'supplierTaxNumber',
-  'invoiceNumber',
-  'invoiceDate',
-  'dueDate',
-  'totalAmount',
-  'netAmount',
-  'vatAmount',
-  'vatRate',
-  'paidAmount'
-];
+// Blue-green deployment: v2 functions run alongside v1
+// Old function name: updateInvoiceFields
+export const updateInvoiceFields_v2 = onRequest(HTTP_OPTS, async (req, res) => {
+  if (!requireMethod(req, res, 'POST')) return;
 
-/**
- * Validates update invoice fields request body
- */
-function validateUpdateFieldsRequest(body) {
-  const errors = [];
+  // 1. Authenticate
+  const authResult = await authenticateRequest(req);
+  if (authResult.error) {
+    return sendError(res, authResult.status, authResult.error);
+  }
+  const user = authResult.user;
 
-  if (!body.supplierId || typeof body.supplierId !== 'string') {
-    errors.push('supplierId is required and must be a string');
+  // 2. Validate request body
+  const body = req.body || {};
+  const validationErrors = validateUpdateFieldsRequest(body);
+  if (validationErrors.length > 0) {
+    return sendError(res, 400, 'Validation failed', { details: validationErrors });
   }
 
-  if (!body.invoiceId || typeof body.invoiceId !== 'string') {
-    errors.push('invoiceId is required and must be a string');
-  }
+  const { supplierId, invoiceId, fields } = body;
 
-  if (!body.fields || typeof body.fields !== 'object') {
-    errors.push('fields is required and must be an object');
-    return errors;
-  }
+  const invoiceRef = db.collection('suppliers').doc(supplierId).collection('invoices').doc(invoiceId);
 
-  const fields = body.fields;
+  try {
+    const result = await db.runTransaction(async (tx) => {
+      const invoiceSnap = await tx.get(invoiceRef);
 
-  // Validate field types
-  if (fields.supplierName !== undefined && typeof fields.supplierName !== 'string') {
-    errors.push('fields.supplierName must be a string');
-  }
-
-  if (fields.supplierTaxNumber !== undefined && typeof fields.supplierTaxNumber !== 'string') {
-    errors.push('fields.supplierTaxNumber must be a string');
-  }
-
-  if (fields.invoiceNumber !== undefined && typeof fields.invoiceNumber !== 'string') {
-    errors.push('fields.invoiceNumber must be a string');
-  }
-
-  if (fields.currency !== undefined && typeof fields.currency !== 'string') {
-    errors.push('fields.currency must be a string');
-  }
-
-  // Validate date fields
-  if (fields.invoiceDate !== undefined) {
-    const date = new Date(fields.invoiceDate);
-    if (isNaN(date.getTime())) {
-      errors.push('fields.invoiceDate must be a valid ISO date string');
-    }
-  }
-
-  if (fields.dueDate !== undefined) {
-    const date = new Date(fields.dueDate);
-    if (isNaN(date.getTime())) {
-      errors.push('fields.dueDate must be a valid ISO date string');
-    }
-  }
-
-  // Validate numeric fields
-  const numericFields = ['totalAmount', 'netAmount', 'vatAmount', 'vatRate', 'paidAmount'];
-  for (const field of numericFields) {
-    if (fields[field] !== undefined) {
-      if (typeof fields[field] !== 'number' || isNaN(fields[field])) {
-        errors.push(`fields.${field} must be a valid number`);
-      } else if (fields[field] < 0) {
-        errors.push(`fields.${field} must be non-negative`);
+      // 3. Check invoice exists
+      if (!invoiceSnap.exists) {
+        throw Object.assign(new Error(`Invoice not found: suppliers/${supplierId}/invoices/${invoiceId}`), {
+          httpStatus: 404,
+        });
       }
-    }
-  }
 
-  // Check for unknown fields
-  const providedFields = Object.keys(fields);
-  const unknownFields = providedFields.filter(f => !EDITABLE_INVOICE_FIELDS.includes(f));
-  if (unknownFields.length > 0) {
-    errors.push(`Unknown fields: ${unknownFields.join(', ')}. Allowed: ${EDITABLE_INVOICE_FIELDS.join(', ')}`);
-  }
+      const invoiceData = invoiceSnap.data();
 
-  return errors;
-}
+      // 4. Build update object
+      const updates = {
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastEditedBy: user.uid,
+        lastEditedByName: getUserDisplayName(user),
+        lastEditedAt: admin.firestore.FieldValue.serverTimestamp(),
+      };
 
-exports.updateInvoiceFields = functions
-  .region(REGION)
-  .runWith(FUNCTION_OPTIONS)
-  .https.onRequest(async (req, res) => {
-    // CORS headers
-    res.set('Access-Control-Allow-Origin', '*');
-    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+      // Track which fields are being updated
+      const updatedFields = [];
 
-    if (req.method === 'OPTIONS') {
-      return res.status(204).send('');
-    }
+      // Process string fields
+      if (fields.supplierName !== undefined) {
+        updates.supplierName = fields.supplierName;
+        updatedFields.push('supplierName');
+      }
+      if (fields.supplierTaxNumber !== undefined) {
+        updates.supplierTaxNumber = fields.supplierTaxNumber;
+        updatedFields.push('supplierTaxNumber');
+      }
+      if (fields.invoiceNumber !== undefined) {
+        updates.invoiceNumber = fields.invoiceNumber;
+        updatedFields.push('invoiceNumber');
+      }
+      if (fields.currency !== undefined) {
+        updates.currency = fields.currency;
+        updatedFields.push('currency');
+      }
 
-    if (req.method !== 'POST') {
-      return res.status(405).json({ error: 'Method not allowed. Use POST.' });
-    }
+      // Process date fields
+      if (fields.invoiceDate !== undefined) {
+        updates.invoiceDate = admin.firestore.Timestamp.fromDate(new Date(fields.invoiceDate));
+        updatedFields.push('invoiceDate');
+      }
+      if (fields.dueDate !== undefined) {
+        updates.dueDate = admin.firestore.Timestamp.fromDate(new Date(fields.dueDate));
+        updatedFields.push('dueDate');
+      }
 
-    // 1. Authenticate
-    const authResult = await authenticateRequest(req);
-    if (authResult.error) {
-      return res.status(authResult.status).json({ error: authResult.error });
-    }
-    const user = authResult.user;
+      // Process numeric fields
+      if (fields.netAmount !== undefined) {
+        updates.netAmount = fields.netAmount;
+        updatedFields.push('netAmount');
+      }
+      if (fields.vatAmount !== undefined) {
+        updates.vatAmount = fields.vatAmount;
+        updatedFields.push('vatAmount');
+      }
+      if (fields.vatRate !== undefined) {
+        updates.vatRate = fields.vatRate;
+        updatedFields.push('vatRate');
+      }
 
-    // 2. Validate request body
-    const body = req.body || {};
-    const validationErrors = validateUpdateFieldsRequest(body);
-    if (validationErrors.length > 0) {
-      return res.status(400).json({
-        error: 'Validation failed',
-        details: validationErrors
-      });
-    }
+      // 5. Handle amount changes with payment recalculation
+      const currentTotalAmount = invoiceData.totalAmount || 0;
+      const currentPaidAmount = invoiceData.paidAmount || 0;
 
-    const { supplierId, invoiceId, fields } = body;
+      let newTotalAmount = currentTotalAmount;
+      let newPaidAmount = currentPaidAmount;
 
-    const invoiceRef = db
-      .collection('suppliers')
-      .doc(supplierId)
-      .collection('invoices')
-      .doc(invoiceId);
+      if (fields.totalAmount !== undefined) {
+        newTotalAmount = fields.totalAmount;
+        updates.totalAmount = newTotalAmount;
+        updatedFields.push('totalAmount');
+      }
 
-    try {
-      const result = await db.runTransaction(async (tx) => {
-        const invoiceSnap = await tx.get(invoiceRef);
+      if (fields.paidAmount !== undefined) {
+        newPaidAmount = fields.paidAmount;
+        updates.paidAmount = newPaidAmount;
+        updatedFields.push('paidAmount');
+      }
 
-        // 3. Check invoice exists
-        if (!invoiceSnap.exists) {
+      // Recalculate unpaidAmount and paymentStatus if amounts changed
+      if (fields.totalAmount !== undefined || fields.paidAmount !== undefined) {
+        // Validate paidAmount doesn't exceed totalAmount
+        if (newPaidAmount > newTotalAmount + 0.01) {
           throw Object.assign(
-            new Error(`Invoice not found: suppliers/${supplierId}/invoices/${invoiceId}`),
-            { httpStatus: 404 }
+            new Error(
+              `paidAmount (${newPaidAmount.toFixed(2)}) cannot exceed totalAmount (${newTotalAmount.toFixed(2)})`
+            ),
+            { httpStatus: 400 }
           );
         }
 
-        const invoiceData = invoiceSnap.data();
+        updates.unpaidAmount = Math.max(0, newTotalAmount - newPaidAmount);
+        updates.paymentStatus = derivePaymentStatus(newPaidAmount, newTotalAmount);
+      }
 
-        // 4. Build update object
-        const updates = {
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          lastEditedBy: user.uid,
-          lastEditedAt: admin.firestore.FieldValue.serverTimestamp()
-        };
+      // 6. Update invoice document
+      tx.update(invoiceRef, updates);
 
-        // Track which fields are being updated
-        const updatedFields = [];
+      return {
+        invoiceId,
+        supplierId,
+        updatedFields,
+        totalAmount: newTotalAmount,
+        paidAmount: newPaidAmount,
+        unpaidAmount: updates.unpaidAmount !== undefined ? updates.unpaidAmount : invoiceData.unpaidAmount || 0,
+        paymentStatus: updates.paymentStatus || invoiceData.paymentStatus,
+      };
+    });
 
-        // Process string fields
-        if (fields.supplierName !== undefined) {
-          updates.supplierName = fields.supplierName;
-          updatedFields.push('supplierName');
-        }
-        if (fields.supplierTaxNumber !== undefined) {
-          updates.supplierTaxNumber = fields.supplierTaxNumber;
-          updatedFields.push('supplierTaxNumber');
-        }
-        if (fields.invoiceNumber !== undefined) {
-          updates.invoiceNumber = fields.invoiceNumber;
-          updatedFields.push('invoiceNumber');
-        }
-        if (fields.currency !== undefined) {
-          updates.currency = fields.currency;
-          updatedFields.push('currency');
-        }
+    console.log(`Invoice fields updated for ${invoiceId}:`, result.updatedFields);
 
-        // Process date fields
-        if (fields.invoiceDate !== undefined) {
-          updates.invoiceDate = admin.firestore.Timestamp.fromDate(new Date(fields.invoiceDate));
-          updatedFields.push('invoiceDate');
-        }
-        if (fields.dueDate !== undefined) {
-          updates.dueDate = admin.firestore.Timestamp.fromDate(new Date(fields.dueDate));
-          updatedFields.push('dueDate');
-        }
-
-        // Process numeric fields
-        if (fields.netAmount !== undefined) {
-          updates.netAmount = fields.netAmount;
-          updatedFields.push('netAmount');
-        }
-        if (fields.vatAmount !== undefined) {
-          updates.vatAmount = fields.vatAmount;
-          updatedFields.push('vatAmount');
-        }
-        if (fields.vatRate !== undefined) {
-          updates.vatRate = fields.vatRate;
-          updatedFields.push('vatRate');
-        }
-
-        // 5. Handle amount changes with payment recalculation
-        const currentTotalAmount = invoiceData.totalAmount || 0;
-        const currentPaidAmount = invoiceData.paidAmount || 0;
-
-        let newTotalAmount = currentTotalAmount;
-        let newPaidAmount = currentPaidAmount;
-
-        if (fields.totalAmount !== undefined) {
-          newTotalAmount = fields.totalAmount;
-          updates.totalAmount = newTotalAmount;
-          updatedFields.push('totalAmount');
-        }
-
-        if (fields.paidAmount !== undefined) {
-          newPaidAmount = fields.paidAmount;
-          updates.paidAmount = newPaidAmount;
-          updatedFields.push('paidAmount');
-        }
-
-        // Recalculate unpaidAmount and paymentStatus if amounts changed
-        if (fields.totalAmount !== undefined || fields.paidAmount !== undefined) {
-          // Validate paidAmount doesn't exceed totalAmount
-          if (newPaidAmount > newTotalAmount + 0.01) {
-            throw Object.assign(
-              new Error(`paidAmount (${newPaidAmount.toFixed(2)}) cannot exceed totalAmount (${newTotalAmount.toFixed(2)})`),
-              { httpStatus: 400 }
-            );
-          }
-
-          updates.unpaidAmount = Math.max(0, newTotalAmount - newPaidAmount);
-          updates.paymentStatus = derivePaymentStatus(newPaidAmount, newTotalAmount);
-        }
-
-        // 6. Update invoice document
-        tx.update(invoiceRef, updates);
-
-        return {
-          invoiceId,
-          supplierId,
-          updatedFields,
-          totalAmount: newTotalAmount,
-          paidAmount: newPaidAmount,
-          unpaidAmount: updates.unpaidAmount !== undefined ? updates.unpaidAmount : (invoiceData.unpaidAmount || 0),
-          paymentStatus: updates.paymentStatus || invoiceData.paymentStatus
-        };
-      });
-
-      console.log(`Invoice fields updated for ${invoiceId}:`, result.updatedFields);
-
-      return res.status(200).json({
-        success: true,
-        message: `Updated ${result.updatedFields.length} field(s): ${result.updatedFields.join(', ')}`,
-        data: result
-      });
-
-    } catch (error) {
-      console.error('Invoice field update failed:', error);
-
-      const httpStatus = error.httpStatus || 500;
-      return res.status(httpStatus).json({
-        error: error.message,
-        code: httpStatus === 500 ? 'INTERNAL_ERROR' : 'UPDATE_ERROR'
-      });
-    }
-  });
+    return res.status(200).json({
+      success: true,
+      message: `Updated ${result.updatedFields.length} field(s): ${result.updatedFields.join(', ')}`,
+      data: result,
+    });
+  } catch (error) {
+    console.error('Invoice field update failed:', error);
+    const httpStatus = error.httpStatus || 500;
+    return sendError(res, httpStatus, error.message, { code: httpStatus === 500 ? 'INTERNAL_ERROR' : 'UPDATE_ERROR' });
+  }
+});
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // UPDATE SUPPLIER FIELDS
@@ -1818,223 +596,101 @@ exports.updateInvoiceFields = functions
 // - Requires Firebase Authentication
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const EDITABLE_SUPPLIER_FIELDS = ['name', 'supplierCategory', 'supplierTaxNumber', 'delivery'];
+// Blue-green deployment: v2 functions run alongside v1
+// Old function name: updateSupplierFields
+export const updateSupplierFields_v2 = onRequest(HTTP_OPTS, async (req, res) => {
+  if (!requireMethod(req, res, 'POST')) return;
 
-/**
- * Validates a time object { hour, minute }
- */
-function validateTimeObject(time, fieldName, errors) {
-  if (typeof time !== 'object' || time === null) {
-    errors.push(`${fieldName} must be an object with hour and minute`);
-    return false;
+  // 1. Authenticate
+  const authResult = await authenticateRequest(req);
+  if (authResult.error) {
+    return sendError(res, authResult.status, authResult.error);
+  }
+  const user = authResult.user;
+
+  // 2. Validate request body
+  const body = req.body || {};
+  const validationErrors = validateUpdateSupplierRequest(body);
+  if (validationErrors.length > 0) {
+    return sendError(res, 400, 'Validation failed', { details: validationErrors });
   }
 
-  if (typeof time.hour !== 'number' || !Number.isInteger(time.hour) || time.hour < 0 || time.hour > 23) {
-    errors.push(`${fieldName}.hour must be an integer between 0 and 23`);
-  }
+  const { supplierId, fields } = body;
+  const supplierRef = db.collection('suppliers').doc(supplierId);
 
-  if (typeof time.minute !== 'number' || !Number.isInteger(time.minute) || time.minute < 0 || time.minute > 59) {
-    errors.push(`${fieldName}.minute must be an integer between 0 and 59`);
-  }
+  try {
+    const result = await db.runTransaction(async (tx) => {
+      const supplierSnap = await tx.get(supplierRef);
 
-  return true;
-}
+      // 3. Check supplier exists
+      if (!supplierSnap.exists) {
+        throw Object.assign(new Error(`Supplier not found: suppliers/${supplierId}`), { httpStatus: 404 });
+      }
 
-/**
- * Validates the delivery object
- */
-function validateDeliveryObject(delivery, errors) {
-  if (typeof delivery !== 'object' || delivery === null) {
-    errors.push('fields.delivery must be an object');
-    return;
-  }
+      // 4. Build update object
+      const updates = {
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastEditedBy: user.uid,
+        lastEditedByName: getUserDisplayName(user),
+        lastEditedAt: admin.firestore.FieldValue.serverTimestamp(),
+      };
 
-  // Validate dayOfWeek (1-7, ISO 8601)
-  if (delivery.dayOfWeek !== undefined) {
-    if (typeof delivery.dayOfWeek !== 'number' || !Number.isInteger(delivery.dayOfWeek) || delivery.dayOfWeek < 1 || delivery.dayOfWeek > 7) {
-      errors.push('fields.delivery.dayOfWeek must be an integer between 1 (Monday) and 7 (Sunday)');
-    }
-  }
+      const updatedFields = [];
 
-  // Validate from time
-  if (delivery.from !== undefined) {
-    validateTimeObject(delivery.from, 'fields.delivery.from', errors);
-  }
+      // Process string fields
+      if (fields.name !== undefined) {
+        updates.name = fields.name;
+        updatedFields.push('name');
+      }
 
-  // Validate to time
-  if (delivery.to !== undefined) {
-    validateTimeObject(delivery.to, 'fields.delivery.to', errors);
-  }
-}
+      if (fields.supplierCategory !== undefined) {
+        updates.supplierCategory = fields.supplierCategory;
+        updatedFields.push('supplierCategory');
+      }
 
-/**
- * Validates update supplier fields request body
- */
-function validateUpdateSupplierRequest(body) {
-  const errors = [];
+      if (fields.supplierTaxNumber !== undefined) {
+        updates.supplierTaxNumber = fields.supplierTaxNumber;
+        updatedFields.push('supplierTaxNumber');
+      }
 
-  if (!body.supplierId || typeof body.supplierId !== 'string') {
-    errors.push('supplierId is required and must be a string');
-  }
-
-  if (!body.fields || typeof body.fields !== 'object') {
-    errors.push('fields is required and must be an object');
-    return errors;
-  }
-
-  const fields = body.fields;
-
-  // Validate name
-  if (fields.name !== undefined && typeof fields.name !== 'string') {
-    errors.push('fields.name must be a string');
-  }
-
-  // Validate supplierCategory
-  if (fields.supplierCategory !== undefined && typeof fields.supplierCategory !== 'string') {
-    errors.push('fields.supplierCategory must be a string');
-  }
-
-  // Validate supplierTaxNumber (string with numbers only)
-  if (fields.supplierTaxNumber !== undefined) {
-    if (typeof fields.supplierTaxNumber !== 'string') {
-      errors.push('fields.supplierTaxNumber must be a string');
-    } else if (!/^\d+$/.test(fields.supplierTaxNumber)) {
-      errors.push('fields.supplierTaxNumber must contain only digits');
-    }
-  }
-
-  // Validate delivery object
-  if (fields.delivery !== undefined) {
-    validateDeliveryObject(fields.delivery, errors);
-  }
-
-  // Check for unknown fields
-  const providedFields = Object.keys(fields);
-  const unknownFields = providedFields.filter(f => !EDITABLE_SUPPLIER_FIELDS.includes(f));
-  if (unknownFields.length > 0) {
-    errors.push(`Unknown fields: ${unknownFields.join(', ')}. Allowed: ${EDITABLE_SUPPLIER_FIELDS.join(', ')}`);
-  }
-
-  return errors;
-}
-
-exports.updateSupplierFields = functions
-  .region(REGION)
-  .runWith(FUNCTION_OPTIONS)
-  .https.onRequest(async (req, res) => {
-    // CORS headers
-    res.set('Access-Control-Allow-Origin', '*');
-    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-
-    if (req.method === 'OPTIONS') {
-      return res.status(204).send('');
-    }
-
-    if (req.method !== 'POST') {
-      return res.status(405).json({ error: 'Method not allowed. Use POST.' });
-    }
-
-    // 1. Authenticate
-    const authResult = await authenticateRequest(req);
-    if (authResult.error) {
-      return res.status(authResult.status).json({ error: authResult.error });
-    }
-    const user = authResult.user;
-
-    // 2. Validate request body
-    const body = req.body || {};
-    const validationErrors = validateUpdateSupplierRequest(body);
-    if (validationErrors.length > 0) {
-      return res.status(400).json({
-        error: 'Validation failed',
-        details: validationErrors
-      });
-    }
-
-    const { supplierId, fields } = body;
-    const supplierRef = db.collection('suppliers').doc(supplierId);
-
-    try {
-      const result = await db.runTransaction(async (tx) => {
-        const supplierSnap = await tx.get(supplierRef);
-
-        // 3. Check supplier exists
-        if (!supplierSnap.exists) {
-          throw Object.assign(
-            new Error(`Supplier not found: suppliers/${supplierId}`),
-            { httpStatus: 404 }
-          );
-        }
-
-        // 4. Build update object
-        const updates = {
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          lastEditedBy: user.uid,
-          lastEditedAt: admin.firestore.FieldValue.serverTimestamp()
+      // Process delivery object
+      if (fields.delivery !== undefined) {
+        updates.delivery = {
+          dayOfWeek: fields.delivery.dayOfWeek,
+          from: {
+            hour: fields.delivery.from?.hour,
+            minute: fields.delivery.from?.minute,
+          },
+          to: {
+            hour: fields.delivery.to?.hour,
+            minute: fields.delivery.to?.minute,
+          },
         };
+        updatedFields.push('delivery');
+      }
 
-        const updatedFields = [];
+      // 5. Update supplier document
+      tx.update(supplierRef, updates);
 
-        // Process string fields
-        if (fields.name !== undefined) {
-          updates.name = fields.name;
-          updatedFields.push('name');
-        }
+      return {
+        supplierId,
+        updatedFields,
+      };
+    });
 
-        if (fields.supplierCategory !== undefined) {
-          updates.supplierCategory = fields.supplierCategory;
-          updatedFields.push('supplierCategory');
-        }
+    console.log(`Supplier fields updated for ${supplierId}:`, result.updatedFields);
 
-        if (fields.supplierTaxNumber !== undefined) {
-          updates.supplierTaxNumber = fields.supplierTaxNumber;
-          updatedFields.push('supplierTaxNumber');
-        }
-
-        // Process delivery object
-        if (fields.delivery !== undefined) {
-          updates.delivery = {
-            dayOfWeek: fields.delivery.dayOfWeek,
-            from: {
-              hour: fields.delivery.from?.hour,
-              minute: fields.delivery.from?.minute
-            },
-            to: {
-              hour: fields.delivery.to?.hour,
-              minute: fields.delivery.to?.minute
-            }
-          };
-          updatedFields.push('delivery');
-        }
-
-        // 5. Update supplier document
-        tx.update(supplierRef, updates);
-
-        return {
-          supplierId,
-          updatedFields
-        };
-      });
-
-      console.log(`Supplier fields updated for ${supplierId}:`, result.updatedFields);
-
-      return res.status(200).json({
-        success: true,
-        message: `Updated ${result.updatedFields.length} field(s): ${result.updatedFields.join(', ')}`,
-        data: result
-      });
-
-    } catch (error) {
-      console.error('Supplier field update failed:', error);
-
-      const httpStatus = error.httpStatus || 500;
-      return res.status(httpStatus).json({
-        error: error.message,
-        code: httpStatus === 500 ? 'INTERNAL_ERROR' : 'UPDATE_ERROR'
-      });
-    }
-  });
+    return res.status(200).json({
+      success: true,
+      message: `Updated ${result.updatedFields.length} field(s): ${result.updatedFields.join(', ')}`,
+      data: result,
+    });
+  } catch (error) {
+    console.error('Supplier field update failed:', error);
+    const httpStatus = error.httpStatus || 500;
+    return sendError(res, httpStatus, error.message, { code: httpStatus === 500 ? 'INTERNAL_ERROR' : 'UPDATE_ERROR' });
+  }
+});
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SIGNED DOWNLOAD URL
@@ -2057,151 +713,56 @@ exports.updateSupplierFields = functions
 // - Requires Firebase Authentication (any authenticated user can download)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-exports.getSignedDownloadUrl = functions
-  .region(REGION)
-  .runWith(FUNCTION_OPTIONS)
-  .https.onRequest(async (req, res) => {
-    // CORS headers
-    res.set('Access-Control-Allow-Origin', '*');
-    res.set('Access-Control-Allow-Headers', 'Authorization, Content-Type');
-    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+// Blue-green deployment: v2 functions run alongside v1
+// Old function name: getSignedDownloadUrl
+export const getSignedDownloadUrl_v2 = onRequest(HTTP_OPTS, async (req, res) => {
+  if (!requireMethod(req, res, 'POST')) return;
 
-    if (req.method === 'OPTIONS') {
-      return res.status(204).send('');
-    }
-
-    if (req.method !== 'POST') {
-      return res.status(405).json({ error: 'Method not allowed. Use POST.' });
-    }
-
-    // Authenticate
-    const idToken = extractBearerToken(req.header('Authorization'));
-    if (!idToken) {
-      return res.status(401).json({ error: 'Missing Authorization: Bearer <token>' });
-    }
-
-    let decodedToken;
-    try {
-      decodedToken = await admin.auth().verifyIdToken(idToken);
-    } catch (error) {
-      return res.status(401).json({
-        error: 'Invalid or expired Firebase ID token',
-        details: error.message
-      });
-    }
-
-    const { filePath } = req.body || {};
-
-    if (!filePath || typeof filePath !== 'string') {
-      return res.status(400).json({ error: 'filePath is required and must be a string' });
-    }
-
-    const bucketName = getBucketName();
-    if (!bucketName) {
-      return res.status(500).json({ error: 'Missing GCS bucket configuration' });
-    }
-
-    try {
-      // Check if file exists
-      const file = storage.bucket(bucketName).file(filePath);
-      const [exists] = await file.exists();
-
-      if (!exists) {
-        return res.status(404).json({ error: 'File not found' });
-      }
-
-      // Generate signed URL for reading/downloading
-      const expiresAtMs = Date.now() + SIGNED_URL_TTL_MS;
-
-      const [downloadUrl] = await file.getSignedUrl({
-        version: 'v4',
-        action: 'read',
-        expires: expiresAtMs
-      });
-
-      return res.status(200).json({
-        downloadUrl,
-        filePath,
-        bucket: bucketName,
-        expiresAt: new Date(expiresAtMs).toISOString()
-      });
-
-    } catch (error) {
-      console.error('Failed to generate signed download URL:', error);
-      return res.status(500).json({
-        error: 'Failed to generate download URL',
-        details: error.message
-      });
-    }
-  });
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// FINANCIAL TRACKING FUNCTIONS
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/**
- * Validates financial entry request
- */
-function validateFinancialEntryRequest(body) {
-  const errors = [];
-
-  // Validate type
-  if (!body.type || !Object.values(ENTRY_TYPE).includes(body.type)) {
-    errors.push(`type is required and must be one of: ${Object.values(ENTRY_TYPE).join(', ')}`);
+  const authResult = await authenticateRequest(req);
+  if (authResult.error) {
+    return sendError(res, authResult.status, authResult.error);
   }
 
-  // Validate category based on type
-  if (body.type === ENTRY_TYPE.income) {
-    if (!body.category || !VALID_INCOME_CATEGORIES.includes(body.category)) {
-      errors.push(`category for income must be one of: ${VALID_INCOME_CATEGORIES.join(', ')}`);
+  const { filePath } = req.body || {};
+
+  if (!filePath || typeof filePath !== 'string') {
+    return sendError(res, 400, 'filePath is required and must be a string');
+  }
+
+  const bucketName = getBucketName();
+  if (!bucketName) {
+    return sendError(res, 500, 'Missing GCS bucket configuration');
+  }
+
+  try {
+    // Check if file exists
+    const file = storage.bucket(bucketName).file(filePath);
+    const [exists] = await file.exists();
+
+    if (!exists) {
+      return sendError(res, 404, 'File not found');
     }
-  } else if (body.type === ENTRY_TYPE.expense) {
-    if (!body.category || !VALID_EXPENSE_CATEGORIES.includes(body.category)) {
-      errors.push(`category for expense must be one of: ${VALID_EXPENSE_CATEGORIES.join(', ')}`);
-    }
+
+    // Generate signed URL for reading/downloading
+    const expiresAtMs = Date.now() + SIGNED_URL_TTL_MS;
+
+    const [downloadUrl] = await file.getSignedUrl({
+      version: 'v4',
+      action: 'read',
+      expires: expiresAtMs,
+    });
+
+    return res.status(200).json({
+      downloadUrl,
+      filePath,
+      bucket: bucketName,
+      expiresAt: new Date(expiresAtMs).toISOString(),
+    });
+  } catch (error) {
+    console.error('Failed to generate signed download URL:', error);
+    return sendError(res, 500, 'Failed to generate download URL', { details: error.message });
   }
-
-  // Validate amount
-  if (typeof body.amount !== 'number' || body.amount <= 0) {
-    errors.push('amount is required and must be a positive number');
-  }
-
-  // Validate date
-  if (!body.date) {
-    errors.push('date is required');
-  } else {
-    const date = new Date(body.date);
-    if (isNaN(date.getTime())) {
-      errors.push('date must be a valid ISO date string');
-    }
-  }
-
-  // Validate description (optional but must be string if provided)
-  if (body.description !== undefined && typeof body.description !== 'string') {
-    errors.push('description must be a string');
-  }
-
-  return errors;
-}
-
-/**
- * Creates a financial entry document
- */
-function buildFinancialEntry({ type, category, amount, date, description, source, metadata, userId }) {
-  return {
-    type,
-    category,
-    amount,
-    date: admin.firestore.Timestamp.fromDate(new Date(date)),
-    description: description || null,
-    source: source || ENTRY_SOURCE.manual,
-    metadata: metadata || {},
-    isDeleted: false,
-    createdBy: userId,
-            createdAt: serverTimestamp(),
-            updatedAt: serverTimestamp()
-  };
-}
+});
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ADD FINANCIAL ENTRY
@@ -2219,72 +780,169 @@ function buildFinancialEntry({ type, category, amount, date, description, source
 // }
 // ═══════════════════════════════════════════════════════════════════════════════
 
-exports.addFinancialEntry = functions
-  .region(REGION)
-  .runWith(FUNCTION_OPTIONS)
-  .https.onRequest(async (req, res) => {
-    res.set('Access-Control-Allow-Origin', '*');
-    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+// Blue-green deployment: v2 functions run alongside v1
+// Old function name: addFinancialEntry
+export const addFinancialEntry_v2 = onRequest(HTTP_OPTS, async (req, res) => {
+  if (!requireMethod(req, res, 'POST')) return;
 
-    if (req.method === 'OPTIONS') {
-      return res.status(204).send('');
-    }
+  // Authenticate
+  const authResult = await authenticateRequest(req);
+  if (authResult.error) {
+    return sendError(res, authResult.status, authResult.error);
+  }
+  const user = authResult.user;
 
-    if (req.method !== 'POST') {
-      return res.status(405).json({ error: 'Method not allowed. Use POST.' });
-    }
+  // Validate
+  const body = req.body || {};
+  const validationErrors = validateFinancialEntryRequest(body);
+  if (validationErrors.length > 0) {
+    return sendError(res, 400, 'Validation failed', { details: validationErrors });
+  }
 
-    // Authenticate
-    const authResult = await authenticateRequest(req);
-    if (authResult.error) {
-      return res.status(authResult.status).json({ error: authResult.error });
-    }
-    const user = authResult.user;
+  try {
+    const entry = buildFinancialEntry({
+      type: body.type,
+      category: body.category,
+      amount: body.amount,
+      date: body.date,
+      description: body.description,
+      source: ENTRY_SOURCE.manual,
+      userId: user.uid,
+      userName: getUserDisplayName(user),
+    });
 
-    // Validate
-    const body = req.body || {};
-    const validationErrors = validateFinancialEntryRequest(body);
-    if (validationErrors.length > 0) {
-      return res.status(400).json({
-        error: 'Validation failed',
-        details: validationErrors
-      });
-    }
+    const docRef = await db.collection(FINANCIAL_ENTRIES_COLLECTION).add(entry);
 
-    try {
-      const entry = buildFinancialEntry({
-        type: body.type,
-        category: body.category,
-        amount: body.amount,
+    console.log(`Financial entry created: ${docRef.id} - ${body.type} ${body.category} ${body.amount}`);
+
+    return res.status(201).json({
+      success: true,
+      message: `${body.type === ENTRY_TYPE.income ? 'Έσοδο' : 'Έξοδο'} καταχωρήθηκε επιτυχώς`,
+      data: {
+        entryId: docRef.id,
+        ...entry,
         date: body.date,
-        description: body.description,
-        source: ENTRY_SOURCE.manual,
-        userId: user.uid
-      });
+      },
+    });
+  } catch (error) {
+    console.error('Failed to add financial entry:', error);
+    return sendError(res, 500, 'Failed to add financial entry', { details: error.message });
+  }
+});
 
-      const docRef = await db.collection(FINANCIAL_ENTRIES_COLLECTION).add(entry);
+// ═══════════════════════════════════════════════════════════════════════════════
+// EDIT FINANCIAL ENTRY
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Edits a manual or recurring financial entry. Invoice payment entries are
+// read-only. Soft-deleted entries cannot be edited.
+//
+// Request Body:
+// {
+//   entryId: string,
+//   fields: {
+//     type?: "income" | "expense",   // Manual only
+//     category?: string,
+//     amount?: number,
+//     date?: string,                 // ISO date string
+//     description?: string | null
+//   }
+// }
+// ═══════════════════════════════════════════════════════════════════════════════
 
-      console.log(`Financial entry created: ${docRef.id} - ${body.type} ${body.category} ${body.amount}`);
+// Blue-green deployment: v2 functions run alongside v1
+// Old function name: editFinancialEntry
+export const editFinancialEntry_v2 = onRequest(HTTP_OPTS, async (req, res) => {
+  if (!requireMethod(req, res, 'POST')) return;
 
-      return res.status(201).json({
-        success: true,
-        message: `${body.type === ENTRY_TYPE.income ? 'Έσοδο' : 'Έξοδο'} καταχωρήθηκε επιτυχώς`,
-        data: {
-          entryId: docRef.id,
-          ...entry,
-          date: body.date
-        }
-      });
+  const authResult = await authenticateRequest(req);
+  if (authResult.error) {
+    return sendError(res, authResult.status, authResult.error);
+  }
+  const user = authResult.user;
 
-    } catch (error) {
-      console.error('Failed to add financial entry:', error);
-      return res.status(500).json({
-        error: 'Failed to add financial entry',
-        details: error.message
-      });
+  const body = req.body || {};
+  const validationErrors = validateUpdateFinancialEntryRequest(body);
+  if (validationErrors.length > 0) {
+    return sendError(res, 400, 'Validation failed', { details: validationErrors });
+  }
+
+  const { entryId, fields } = body;
+
+  try {
+    const entryRef = db.collection(FINANCIAL_ENTRIES_COLLECTION).doc(entryId);
+    const entrySnap = await entryRef.get();
+
+    if (!entrySnap.exists) {
+      return sendError(res, 404, 'Η εγγραφή δεν βρέθηκε');
     }
-  });
+
+    const current = entrySnap.data();
+
+    if (current.isDeleted) {
+      return sendError(res, 400, 'Δεν μπορείτε να επεξεργαστείτε διαγραμμένες εγγραφές');
+    }
+
+    if (current.source === ENTRY_SOURCE.invoicePayment) {
+      return sendError(res, 400, 'Δεν μπορείτε να επεξεργαστείτε εγγραφές πληρωμών τιμολογίων');
+    }
+
+    if (current.source === ENTRY_SOURCE.recurring && fields.type !== undefined) {
+      return sendError(res, 400, 'Δεν μπορείτε να αλλάξετε τον τύπο σε πάγια έξοδα');
+    }
+
+    // Determine effective type for category validation
+    const effectiveType = fields.type ?? current.type;
+
+    // If type is changing, category must also be provided
+    if (fields.type !== undefined && fields.type !== current.type && fields.category === undefined) {
+      const validCategories =
+        effectiveType === ENTRY_TYPE.income ? VALID_INCOME_CATEGORIES : VALID_EXPENSE_CATEGORIES;
+      if (!validCategories.includes(current.category)) {
+        return sendError(res, 400, 'Πρέπει να δώσετε κατηγορία όταν αλλάζετε τον τύπο', {
+          details: [`category is required when changing type to ${effectiveType}`],
+        });
+      }
+    }
+
+    // Validate category against effective type
+    if (fields.category !== undefined) {
+      const validCategories =
+        effectiveType === ENTRY_TYPE.income ? VALID_INCOME_CATEGORIES : VALID_EXPENSE_CATEGORIES;
+      if (!validCategories.includes(fields.category)) {
+        return sendError(res, 400, 'Validation failed', {
+          details: [`category for ${effectiveType} must be one of: ${validCategories.join(', ')}`],
+        });
+      }
+    }
+
+    // Build update object
+    const updates = {
+      updatedAt: serverTimestamp(),
+      updatedBy: user.uid,
+      updatedByName: getUserDisplayName(user),
+    };
+
+    if (fields.type !== undefined) updates.type = fields.type;
+    if (fields.category !== undefined) updates.category = fields.category;
+    if (fields.amount !== undefined) updates.amount = fields.amount;
+    if (fields.date !== undefined) updates.date = admin.firestore.Timestamp.fromDate(new Date(fields.date));
+    if (fields.description !== undefined) updates.description = fields.description === null ? null : fields.description;
+
+    await entryRef.update(updates);
+
+    console.log(`Financial entry updated: ${entryId}`);
+
+    return res.status(200).json({
+      success: true,
+      message: 'Η εγγραφή ενημερώθηκε επιτυχώς',
+      data: { entryId, updatedFields: Object.keys(fields) },
+    });
+  } catch (error) {
+    console.error('Failed to update financial entry:', error);
+    return sendError(res, 500, 'Failed to update financial entry', { details: error.message });
+  }
+});
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // DELETE FINANCIAL ENTRY (Soft Delete)
@@ -2298,64 +956,50 @@ exports.addFinancialEntry = functions
 // }
 // ═══════════════════════════════════════════════════════════════════════════════
 
-exports.deleteFinancialEntry = functions
-  .region(REGION)
-  .runWith(FUNCTION_OPTIONS)
-  .https.onRequest(async (req, res) => {
-    res.set('Access-Control-Allow-Origin', '*');
-    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+// Blue-green deployment: v2 functions run alongside v1
+// Old function name: deleteFinancialEntry
+export const deleteFinancialEntry_v2 = onRequest(HTTP_OPTS, async (req, res) => {
+  if (!requireMethod(req, res, 'POST')) return;
 
-    if (req.method === 'OPTIONS') {
-      return res.status(204).send('');
+  const authResult = await authenticateRequest(req);
+  if (authResult.error) {
+    return sendError(res, authResult.status, authResult.error);
+  }
+  const user = authResult.user;
+
+  const { entryId } = req.body || {};
+  if (!entryId || typeof entryId !== 'string') {
+    return sendError(res, 400, 'entryId is required and must be a string');
+  }
+
+  try {
+    const entryRef = db.collection(FINANCIAL_ENTRIES_COLLECTION).doc(entryId);
+    const entrySnap = await entryRef.get();
+
+    if (!entrySnap.exists) {
+      return sendError(res, 404, 'Entry not found');
     }
 
-    if (req.method !== 'POST') {
-      return res.status(405).json({ error: 'Method not allowed. Use POST.' });
-    }
+    await entryRef.update({
+      isDeleted: true,
+      deletedBy: user.uid,
+      deletedByName: getUserDisplayName(user),
+      deletedAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
 
-    const authResult = await authenticateRequest(req);
-    if (authResult.error) {
-      return res.status(authResult.status).json({ error: authResult.error });
-    }
-    const user = authResult.user;
+    console.log(`Financial entry soft deleted: ${entryId}`);
 
-    const { entryId } = req.body || {};
-    if (!entryId || typeof entryId !== 'string') {
-      return res.status(400).json({ error: 'entryId is required and must be a string' });
-    }
-
-    try {
-      const entryRef = db.collection(FINANCIAL_ENTRIES_COLLECTION).doc(entryId);
-      const entrySnap = await entryRef.get();
-
-      if (!entrySnap.exists) {
-        return res.status(404).json({ error: 'Entry not found' });
-      }
-
-      await entryRef.update({
-        isDeleted: true,
-        deletedBy: user.uid,
-        deletedAt: serverTimestamp(),
-            updatedAt: serverTimestamp()
-          });
-
-      console.log(`Financial entry soft deleted: ${entryId}`);
-
-      return res.status(200).json({
-        success: true,
-        message: 'Η εγγραφή διαγράφηκε επιτυχώς',
-        entryId
-      });
-
-    } catch (error) {
-      console.error('Failed to delete financial entry:', error);
-      return res.status(500).json({
-        error: 'Failed to delete entry',
-        details: error.message
-      });
-    }
-  });
+    return res.status(200).json({
+      success: true,
+      message: 'Η εγγραφή διαγράφηκε επιτυχώς',
+      entryId,
+    });
+  } catch (error) {
+    console.error('Failed to delete financial entry:', error);
+    return sendError(res, 500, 'Failed to delete entry', { details: error.message });
+  }
+});
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // GET FINANCIAL REPORT
@@ -2372,140 +1016,96 @@ exports.deleteFinancialEntry = functions
 // }
 // ═══════════════════════════════════════════════════════════════════════════════
 
-exports.getFinancialReport = functions
-  .region(REGION)
-  .runWith(FUNCTION_OPTIONS)
-  .https.onRequest(async (req, res) => {
-    res.set('Access-Control-Allow-Origin', '*');
-    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+// Blue-green deployment: v2 functions run alongside v1
+// Old function name: getFinancialReport
+export const getFinancialReport_v2 = onRequest(HTTP_OPTS, async (req, res) => {
+  if (!requireMethod(req, res, 'POST')) return;
 
-    if (req.method === 'OPTIONS') {
-      return res.status(204).send('');
+  const authResult = await authenticateRequest(req);
+  if (authResult.error) {
+    return sendError(res, authResult.status, authResult.error);
+  }
+
+  const { startDate, endDate, type, includeDeleted } = req.body || {};
+
+  if (!startDate || !endDate) {
+    return sendError(res, 400, 'startDate and endDate are required');
+  }
+
+  const start = new Date(startDate + 'T00:00:00Z');
+  const end = new Date(endDate + 'T23:59:59.999Z');
+
+  if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+    return sendError(res, 400, 'Invalid date format');
+  }
+
+  try {
+    let query = db
+      .collection(FINANCIAL_ENTRIES_COLLECTION)
+      .where('date', '>=', admin.firestore.Timestamp.fromDate(start))
+      .where('date', '<=', admin.firestore.Timestamp.fromDate(end));
+
+    if (type && Object.values(ENTRY_TYPE).includes(type)) {
+      query = query.where('type', '==', type);
     }
 
-    if (req.method !== 'POST') {
-      return res.status(405).json({ error: 'Method not allowed. Use POST.' });
-    }
+    const snapshot = await query.orderBy('date', 'desc').get();
 
-    const authResult = await authenticateRequest(req);
-    if (authResult.error) {
-      return res.status(authResult.status).json({ error: authResult.error });
-    }
+    const entries = [];
+    let totalIncome = 0;
+    let totalExpenses = 0;
+    const incomeBreakdown = {};
+    const expenseBreakdown = {};
 
-    const { startDate, endDate, type, includeDeleted } = req.body || {};
+    snapshot.forEach((doc) => {
+      const data = doc.data();
 
-    if (!startDate || !endDate) {
-      return res.status(400).json({ error: 'startDate and endDate are required' });
-    }
-
-    const start = new Date(startDate);
-    const end = new Date(endDate);
-    end.setHours(23, 59, 59, 999); // Include entire end day
-
-    if (isNaN(start.getTime()) || isNaN(end.getTime())) {
-      return res.status(400).json({ error: 'Invalid date format' });
-    }
-
-    try {
-      let query = db.collection(FINANCIAL_ENTRIES_COLLECTION)
-        .where('date', '>=', admin.firestore.Timestamp.fromDate(start))
-        .where('date', '<=', admin.firestore.Timestamp.fromDate(end));
-
-      if (type && Object.values(ENTRY_TYPE).includes(type)) {
-        query = query.where('type', '==', type);
+      // Skip deleted unless requested
+      if (data.isDeleted && !includeDeleted) {
+        return;
       }
 
-      const snapshot = await query.orderBy('date', 'desc').get();
+      const entry = {
+        id: doc.id,
+        ...data,
+        date: data.date?.toDate?.()?.toISOString() || data.date,
+      };
+      entries.push(entry);
 
-      const entries = [];
-      let totalIncome = 0;
-      let totalExpenses = 0;
-      const incomeBreakdown = {};
-      const expenseBreakdown = {};
-
-      snapshot.forEach(doc => {
-        const data = doc.data();
-        
-        // Skip deleted unless requested
-        if (data.isDeleted && !includeDeleted) {
-          return;
+      // Calculate totals (only non-deleted)
+      if (!data.isDeleted) {
+        if (data.type === ENTRY_TYPE.income) {
+          totalIncome += data.amount;
+          incomeBreakdown[data.category] = (incomeBreakdown[data.category] || 0) + data.amount;
+        } else if (data.type === ENTRY_TYPE.expense) {
+          totalExpenses += data.amount;
+          expenseBreakdown[data.category] = (expenseBreakdown[data.category] || 0) + data.amount;
         }
+      }
+    });
 
-        const entry = {
-          id: doc.id,
-          ...data,
-          date: data.date?.toDate?.()?.toISOString() || data.date
-        };
-        entries.push(entry);
-
-        // Calculate totals (only non-deleted)
-        if (!data.isDeleted) {
-          if (data.type === ENTRY_TYPE.income) {
-            totalIncome += data.amount;
-            incomeBreakdown[data.category] = (incomeBreakdown[data.category] || 0) + data.amount;
-          } else if (data.type === ENTRY_TYPE.expense) {
-            totalExpenses += data.amount;
-            expenseBreakdown[data.category] = (expenseBreakdown[data.category] || 0) + data.amount;
-          }
-        }
-      });
-
-      return res.status(200).json({
-        success: true,
-        data: {
-          period: { startDate, endDate },
-          summary: {
-            totalIncome: Math.round(totalIncome * 100) / 100,
-            totalExpenses: Math.round(totalExpenses * 100) / 100,
-            netBalance: Math.round((totalIncome - totalExpenses) * 100) / 100,
-            entryCount: entries.length
-          },
-          breakdown: {
-            income: incomeBreakdown,
-            expenses: expenseBreakdown
-          },
-          entries
-        }
-      });
-
-    } catch (error) {
-      console.error('Failed to get financial report:', error);
-      return res.status(500).json({
-        error: 'Failed to get report',
-        details: error.message
-      });
-    }
-  });
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// RECURRING EXPENSES
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/**
- * Validates recurring expense request
- */
-function validateRecurringExpenseRequest(body) {
-  const errors = [];
-
-  if (!body.category || !VALID_EXPENSE_CATEGORIES.includes(body.category)) {
-    errors.push(`category must be one of: ${VALID_EXPENSE_CATEGORIES.join(', ')}`);
+    return res.status(200).json({
+      success: true,
+      data: {
+        period: { startDate, endDate },
+        summary: {
+          totalIncome: Math.round(totalIncome * 100) / 100,
+          totalExpenses: Math.round(totalExpenses * 100) / 100,
+          netBalance: Math.round((totalIncome - totalExpenses) * 100) / 100,
+          entryCount: entries.length,
+        },
+        breakdown: {
+          income: incomeBreakdown,
+          expenses: expenseBreakdown,
+        },
+        entries,
+      },
+    });
+  } catch (error) {
+    console.error('Failed to get financial report:', error);
+    return sendError(res, 500, 'Failed to get report', { details: error.message });
   }
-
-  if (typeof body.amount !== 'number' || body.amount <= 0) {
-    errors.push('amount is required and must be a positive number');
-  }
-
-  if (!body.dayOfMonth || typeof body.dayOfMonth !== 'number' || body.dayOfMonth < 1 || body.dayOfMonth > 28) {
-    errors.push('dayOfMonth is required and must be between 1 and 28');
-  }
-
-  if (body.description !== undefined && typeof body.description !== 'string') {
-    errors.push('description must be a string');
-  }
-
-  return errors;
-}
+});
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ADD RECURRING EXPENSE
@@ -2522,70 +1122,53 @@ function validateRecurringExpenseRequest(body) {
 // }
 // ═══════════════════════════════════════════════════════════════════════════════
 
-exports.addRecurringExpense = functions
-  .region(REGION)
-  .runWith(FUNCTION_OPTIONS)
-  .https.onRequest(async (req, res) => {
-    res.set('Access-Control-Allow-Origin', '*');
-    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+// Blue-green deployment: v2 functions run alongside v1
+// Old function name: addRecurringExpense
+export const addRecurringExpense_v2 = onRequest(HTTP_OPTS, async (req, res) => {
+  if (!requireMethod(req, res, 'POST')) return;
 
-    if (req.method === 'OPTIONS') {
-      return res.status(204).send('');
-    }
+  const authResult = await authenticateRequest(req);
+  if (authResult.error) {
+    return sendError(res, authResult.status, authResult.error);
+  }
+  const user = authResult.user;
 
-    if (req.method !== 'POST') {
-      return res.status(405).json({ error: 'Method not allowed. Use POST.' });
-    }
+  const body = req.body || {};
+  const validationErrors = validateRecurringExpenseRequest(body);
+  if (validationErrors.length > 0) {
+    return sendError(res, 400, 'Validation failed', { details: validationErrors });
+  }
 
-    const authResult = await authenticateRequest(req);
-    if (authResult.error) {
-      return res.status(authResult.status).json({ error: authResult.error });
-    }
-    const user = authResult.user;
+  try {
+    const recurringExpense = {
+      category: body.category,
+      amount: body.amount,
+      dayOfMonth: body.dayOfMonth,
+      description: body.description || null,
+      isActive: true,
+      createdBy: user.uid,
+      createdByName: getUserDisplayName(user),
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    };
 
-    const body = req.body || {};
-    const validationErrors = validateRecurringExpenseRequest(body);
-    if (validationErrors.length > 0) {
-      return res.status(400).json({
-        error: 'Validation failed',
-        details: validationErrors
-      });
-    }
+    const docRef = await db.collection(RECURRING_EXPENSES_COLLECTION).add(recurringExpense);
 
-    try {
-      const recurringExpense = {
-        category: body.category,
-        amount: body.amount,
-        dayOfMonth: body.dayOfMonth,
-        description: body.description || null,
-        isActive: true,
-        createdBy: user.uid,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp()
-      };
+    console.log(`Recurring expense created: ${docRef.id} - ${body.category} ${body.amount}`);
 
-      const docRef = await db.collection(RECURRING_EXPENSES_COLLECTION).add(recurringExpense);
-
-      console.log(`Recurring expense created: ${docRef.id} - ${body.category} ${body.amount}`);
-
-      return res.status(201).json({
-        success: true,
-        message: 'Πάγιο έξοδο δημιουργήθηκε επιτυχώς',
-        data: {
-          recurringId: docRef.id,
-          ...recurringExpense
-        }
-      });
-
-    } catch (error) {
-      console.error('Failed to add recurring expense:', error);
-      return res.status(500).json({
-        error: 'Failed to add recurring expense',
-        details: error.message
-      });
-    }
-  });
+    return res.status(201).json({
+      success: true,
+      message: 'Πάγιο έξοδο δημιουργήθηκε επιτυχώς',
+      data: {
+        recurringId: docRef.id,
+        ...recurringExpense,
+      },
+    });
+  } catch (error) {
+    console.error('Failed to add recurring expense:', error);
+    return sendError(res, 500, 'Failed to add recurring expense', { details: error.message });
+  }
+});
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // UPDATE RECURRING EXPENSE
@@ -2605,93 +1188,82 @@ exports.addRecurringExpense = functions
 // }
 // ═══════════════════════════════════════════════════════════════════════════════
 
-exports.updateRecurringExpense = functions
-  .region(REGION)
-  .runWith(FUNCTION_OPTIONS)
-  .https.onRequest(async (req, res) => {
-    res.set('Access-Control-Allow-Origin', '*');
-    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+// Blue-green deployment: v2 functions run alongside v1
+// Old function name: updateRecurringExpense
+export const updateRecurringExpense_v2 = onRequest(HTTP_OPTS, async (req, res) => {
+  if (!requireMethod(req, res, 'POST')) return;
 
-    if (req.method === 'OPTIONS') {
-      return res.status(204).send('');
+  const authResult = await authenticateRequest(req);
+  if (authResult.error) {
+    return sendError(res, authResult.status, authResult.error);
+  }
+  const user = authResult.user;
+
+  const { recurringId, fields } = req.body || {};
+
+  if (!recurringId || typeof recurringId !== 'string') {
+    return sendError(res, 400, 'recurringId is required');
+  }
+
+  if (!fields || typeof fields !== 'object') {
+    return sendError(res, 400, 'fields is required and must be an object');
+  }
+
+  // Validate fields
+  const errors = [];
+  if (fields.amount !== undefined && (typeof fields.amount !== 'number' || fields.amount <= 0)) {
+    errors.push('amount must be a positive number');
+  }
+  if (
+    fields.dayOfMonth !== undefined &&
+    (typeof fields.dayOfMonth !== 'number' || fields.dayOfMonth < 1 || fields.dayOfMonth > 28)
+  ) {
+    errors.push('dayOfMonth must be between 1 and 28');
+  }
+  if (fields.description !== undefined && typeof fields.description !== 'string') {
+    errors.push('description must be a string');
+  }
+  if (fields.isActive !== undefined && typeof fields.isActive !== 'boolean') {
+    errors.push('isActive must be a boolean');
+  }
+
+  if (errors.length > 0) {
+    return sendError(res, 400, 'Validation failed', { details: errors });
+  }
+
+  try {
+    const recurringRef = db.collection(RECURRING_EXPENSES_COLLECTION).doc(recurringId);
+    const recurringSnap = await recurringRef.get();
+
+    if (!recurringSnap.exists) {
+      return sendError(res, 404, 'Recurring expense not found');
     }
 
-    if (req.method !== 'POST') {
-      return res.status(405).json({ error: 'Method not allowed. Use POST.' });
-      }
+    const updates = {
+      updatedAt: serverTimestamp(),
+      lastEditedBy: user.uid,
+      lastEditedByName: getUserDisplayName(user),
+    };
 
-    const authResult = await authenticateRequest(req);
-    if (authResult.error) {
-      return res.status(authResult.status).json({ error: authResult.error });
-    }
-    const user = authResult.user;
+    if (fields.amount !== undefined) updates.amount = fields.amount;
+    if (fields.dayOfMonth !== undefined) updates.dayOfMonth = fields.dayOfMonth;
+    if (fields.description !== undefined) updates.description = fields.description;
+    if (fields.isActive !== undefined) updates.isActive = fields.isActive;
 
-    const { recurringId, fields } = req.body || {};
+    await recurringRef.update(updates);
 
-    if (!recurringId || typeof recurringId !== 'string') {
-      return res.status(400).json({ error: 'recurringId is required' });
-    }
+    console.log(`Recurring expense updated: ${recurringId}`);
 
-    if (!fields || typeof fields !== 'object') {
-      return res.status(400).json({ error: 'fields is required and must be an object' });
-    }
-
-    // Validate fields
-    const errors = [];
-    if (fields.amount !== undefined && (typeof fields.amount !== 'number' || fields.amount <= 0)) {
-      errors.push('amount must be a positive number');
-    }
-    if (fields.dayOfMonth !== undefined && (typeof fields.dayOfMonth !== 'number' || fields.dayOfMonth < 1 || fields.dayOfMonth > 28)) {
-      errors.push('dayOfMonth must be between 1 and 28');
-    }
-    if (fields.description !== undefined && typeof fields.description !== 'string') {
-      errors.push('description must be a string');
-    }
-    if (fields.isActive !== undefined && typeof fields.isActive !== 'boolean') {
-      errors.push('isActive must be a boolean');
-    }
-
-    if (errors.length > 0) {
-      return res.status(400).json({ error: 'Validation failed', details: errors });
-    }
-
-    try {
-      const recurringRef = db.collection(RECURRING_EXPENSES_COLLECTION).doc(recurringId);
-      const recurringSnap = await recurringRef.get();
-
-      if (!recurringSnap.exists) {
-        return res.status(404).json({ error: 'Recurring expense not found' });
-      }
-
-      const updates = {
-        updatedAt: serverTimestamp(),
-        lastEditedBy: user.uid
-      };
-
-      if (fields.amount !== undefined) updates.amount = fields.amount;
-      if (fields.dayOfMonth !== undefined) updates.dayOfMonth = fields.dayOfMonth;
-      if (fields.description !== undefined) updates.description = fields.description;
-      if (fields.isActive !== undefined) updates.isActive = fields.isActive;
-
-      await recurringRef.update(updates);
-
-      console.log(`Recurring expense updated: ${recurringId}`);
-
-      return res.status(200).json({
-        success: true,
-        message: 'Πάγιο έξοδο ενημερώθηκε επιτυχώς',
-        recurringId
-      });
-
-    } catch (error) {
-      console.error('Failed to update recurring expense:', error);
-      return res.status(500).json({
-        error: 'Failed to update recurring expense',
-        details: error.message
-      });
-    }
-  });
+    return res.status(200).json({
+      success: true,
+      message: 'Πάγιο έξοδο ενημερώθηκε επιτυχώς',
+      recurringId,
+    });
+  } catch (error) {
+    console.error('Failed to update recurring expense:', error);
+    return sendError(res, 500, 'Failed to update recurring expense', { details: error.message });
+  }
+});
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // PROCESS RECURRING EXPENSES (Scheduled)
@@ -2700,20 +1272,24 @@ exports.updateRecurringExpense = functions
 // Runs daily to generate expense entries for recurring expenses.
 // ═══════════════════════════════════════════════════════════════════════════════
 
-exports.processRecurringExpenses = functions
-  .region(REGION)
-  .runWith(FUNCTION_OPTIONS)
-  .pubsub.schedule('0 6 * * *')  // Run at 6:00 AM daily
-  .timeZone('Europe/Athens')
-  .onRun(async () => {
-    const today = new Date();
-    const dayOfMonth = today.getDate();
+// Blue-green deployment: v2 functions run alongside v1
+// Old function name: processRecurringExpenses
+export const processRecurringExpenses_v2 = onSchedule(
+  {
+    region: REGION,
+    serviceAccount: SERVICE_ACCOUNT_EMAIL,
+    schedule: '0 6 * * *', // Run at 6:00 AM daily
+    timeZone: 'Europe/Athens',
+  },
+  async (_event) => {
+    const { utcDate: today, dayOfMonth } = getAthensToday();
 
     console.log(`Processing recurring expenses for day ${dayOfMonth}`);
 
     try {
       // Find all active recurring expenses for today's day of month
-      const snapshot = await db.collection(RECURRING_EXPENSES_COLLECTION)
+      const snapshot = await db
+        .collection(RECURRING_EXPENSES_COLLECTION)
         .where('isActive', '==', true)
         .where('dayOfMonth', '==', dayOfMonth)
         .get();
@@ -2726,9 +1302,9 @@ exports.processRecurringExpenses = functions
       const batch = db.batch();
       let count = 0;
 
-      snapshot.forEach(doc => {
+      snapshot.forEach((doc) => {
         const recurring = doc.data();
-        
+
         const entry = {
           type: ENTRY_TYPE.expense,
           category: recurring.category,
@@ -2737,12 +1313,13 @@ exports.processRecurringExpenses = functions
           description: recurring.description || `Πάγιο έξοδο: ${recurring.category}`,
           source: ENTRY_SOURCE.recurring,
           metadata: {
-            recurringExpenseId: doc.id
+            recurringExpenseId: doc.id,
           },
           isDeleted: false,
           createdBy: recurring.createdBy,
+          createdByName: recurring.createdByName || null,
           createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp()
+          updatedAt: serverTimestamp(),
         };
 
         const newEntryRef = db.collection(FINANCIAL_ENTRIES_COLLECTION).doc();
@@ -2750,16 +1327,16 @@ exports.processRecurringExpenses = functions
         count++;
       });
 
-        await batch.commit();
+      await batch.commit();
 
       console.log(`Created ${count} recurring expense entries for day ${dayOfMonth}`);
       return null;
-
     } catch (error) {
       console.error('Failed to process recurring expenses:', error);
-      throw error;
+      return null;
     }
-  });
+  }
+);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // GET RECURRING EXPENSES
@@ -2768,50 +1345,167 @@ exports.processRecurringExpenses = functions
 // Lists all recurring expenses.
 // ═══════════════════════════════════════════════════════════════════════════════
 
-exports.getRecurringExpenses = functions
-  .region(REGION)
-  .runWith(FUNCTION_OPTIONS)
-  .https.onRequest(async (req, res) => {
-    res.set('Access-Control-Allow-Origin', '*');
-    res.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
-    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+// Blue-green deployment: v2 functions run alongside v1
+// Old function name: getRecurringExpenses
+export const getRecurringExpenses_v2 = onRequest(HTTP_OPTS, async (req, res) => {
+  if (!requireMethod(req, res, 'GET')) return;
 
-    if (req.method === 'OPTIONS') {
-      return res.status(204).send('');
-      }
+  const authResult = await authenticateRequest(req);
+  if (authResult.error) {
+    return sendError(res, authResult.status, authResult.error);
+  }
 
-    if (req.method !== 'GET') {
-      return res.status(405).json({ error: 'Method not allowed. Use GET.' });
-    }
+  try {
+    const snapshot = await db.collection(RECURRING_EXPENSES_COLLECTION).orderBy('createdAt', 'desc').get();
 
-    const authResult = await authenticateRequest(req);
-    if (authResult.error) {
-      return res.status(authResult.status).json({ error: authResult.error });
-    }
-
-    try {
-      const snapshot = await db.collection(RECURRING_EXPENSES_COLLECTION)
-        .orderBy('createdAt', 'desc')
-        .get();
-
-      const expenses = [];
-      snapshot.forEach(doc => {
-        expenses.push({
-          id: doc.id,
-          ...doc.data()
-        });
+    const expenses = [];
+    snapshot.forEach((doc) => {
+      expenses.push({
+        id: doc.id,
+        ...doc.data(),
       });
+    });
 
+    return res.status(200).json({
+      success: true,
+      data: expenses,
+    });
+  } catch (error) {
+    console.error('Failed to get recurring expenses:', error);
+    return sendError(res, 500, 'Failed to get recurring expenses', { details: error.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXPORT INVOICES (ZIP Download)
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Accepts a list of selected invoices (by supplierId + invoiceId), fetches
+// their PDFs from GCS, streams them into a ZIP archive, uploads the ZIP to a
+// temporary GCS path, records a download event on each invoice, and returns
+// a signed download URL.
+//
+// The date-range listing and supplier grouping happens entirely on the client
+// via the Firestore SDK. This function only handles the selected downloads.
+//
+// Request Body:
+// {
+//   invoices: [                          // Required - selected invoices
+//     { supplierId: string, invoiceId: string },
+//     ...
+//   ]
+// }
+//
+// Response:
+// {
+//   success: true,
+//   message: string,
+//   data: {
+//     downloadUrl: string,
+//     invoiceCount: number,
+//     zipPath: string,
+//     expiresAt: string
+//   }
+// }
+//
+// Download tracking:
+// - After a successful export, each invoice document receives a
+//   `downloadedBy.<uid>` map entry with `lastDownloadedAt` and
+//   `downloadCount` so the client UI can show "already downloaded" badges.
+//
+// Security:
+// - Requires Firebase Authentication
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const EXPORT_OPTS = {
+  ...HTTP_OPTS,
+  timeoutSeconds: 540,
+  memory: '1GiB',
+};
+
+// Blue-green deployment: v2 functions run alongside v1
+// Old function name: exportInvoices
+export const exportInvoices_v2 = onRequest(EXPORT_OPTS, async (req, res) => {
+  if (!requireMethod(req, res, 'POST')) return;
+
+  // 1. Authenticate
+  const authResult = await authenticateRequest(req);
+  if (authResult.error) {
+    return sendError(res, authResult.status, authResult.error);
+  }
+  const user = authResult.user;
+
+  // 2. Validate request body
+  const body = req.body || {};
+  const validationErrors = validateExportRequest(body);
+  if (validationErrors.length > 0) {
+    return sendError(res, 400, 'Validation failed', { details: validationErrors });
+  }
+
+  const { invoices: invoicePairs } = body;
+
+  try {
+    // 3. Fetch invoice documents by direct path
+    const invoices = await fetchInvoiceDocuments(invoicePairs);
+
+    if (invoices.length === 0) {
       return res.status(200).json({
         success: true,
-        data: expenses
-      });
-
-    } catch (error) {
-      console.error('Failed to get recurring expenses:', error);
-      return res.status(500).json({
-        error: 'Failed to get recurring expenses',
-        details: error.message
+        message: 'Δεν βρέθηκαν τιμολόγια για τα επιλεγμένα αναγνωριστικά',
+        data: { invoiceCount: 0 },
       });
     }
-  });
+
+    // 4. Filter to invoices that have a PDF file
+    const exportable = invoices.filter((inv) => inv.filePath);
+    if (exportable.length === 0) {
+      return res.status(200).json({
+        success: true,
+        message: 'Δεν βρέθηκαν αρχεία PDF για τα επιλεγμένα τιμολόγια',
+        data: { invoiceCount: invoices.length },
+      });
+    }
+
+    console.log(`Exporting ${exportable.length} invoices for user ${user.uid}`);
+
+    // 5. Stream PDFs into a ZIP and upload to GCS
+    const zipPath = await streamInvoicesZip({
+      invoices: exportable,
+      uid: user.uid,
+    });
+
+    // 6. Record download event on each exported invoice
+    const exportedPairs = exportable.map(({ supplierId, invoiceId }) => ({
+      supplierId,
+      invoiceId,
+    }));
+    try {
+      await recordDownloads({ invoicePairs: exportedPairs, uid: user.uid, userName: getUserDisplayName(user) });
+    } catch (trackingError) {
+      // Log but don't fail the export — download tracking is secondary
+      console.error('Failed to record download tracking:', trackingError);
+    }
+
+    // 7. Generate signed download URL
+    const { downloadUrl, expiresAt } = await getExportDownloadUrl(zipPath);
+
+    console.log(`Export complete: ${exportable.length} invoices → ${zipPath}`);
+
+    return res.status(200).json({
+      success: true,
+      message: `Εξαγωγή ${exportable.length} τιμολογίων ολοκληρώθηκε`,
+      data: {
+        downloadUrl,
+        invoiceCount: exportable.length,
+        zipPath,
+        expiresAt,
+      },
+    });
+  } catch (error) {
+    console.error('Invoice export failed:', error);
+    return sendError(res, 500, 'Αποτυχία εξαγωγής τιμολογίων', {
+      details: error.message,
+      code: 'EXPORT_ERROR',
+    });
+  }
+});
