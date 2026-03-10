@@ -295,7 +295,8 @@ async function runInvoiceOcrAttempt(pageBuffers) {
     '   - The supplier is the ISSUING company shown in the document header (top area of page 1).',
     '   - Supplier info typically appears BEFORE any "ΣΤΟΙΧΕΙΑ ΠΕΛΑΤΗ" or "ΣΤΟΙΧΕΙΑ ΑΠΟΣΤΟΛΗΣ" sections.',
     '   - The supplier block contains: company name/logo, address, phone, ΑΦΜ, ΔΟΥ.',
-    '   - CRITICAL: The supplier name MUST have its own ΑΦΜ (9-digit tax number) directly associated with it.',
+    '   - CRITICAL: The supplier name MUST have its own ΑΦΜ (tax number) directly associated with it.',
+    '     Greek ΑΦΜ is 9 digits, sometimes prefixed with "EL" (e.g., EL133778466). Strip any "EL"/"GR" prefix and return only the 9 digits.',
     '   - NEVER confuse supplier with customer. The customer appears AFTER sections like:',
     '     "ΣΤΟΙΧΕΙΑ ΠΕΛΑΤΗ", "ΕΠΩΝΥΜΙΑ ΠΕΛΑΤΗ", "ΠΕΛΑΤΗΣ", "ΑΠΟΔΕΚΤΗΣ", "ΠΑΡΑΛΗΠΤΗΣ".',
     '   - CRITICAL EXCLUSION - ERP/SOFTWARE BRANDING:',
@@ -311,14 +312,15 @@ async function runInvoiceOcrAttempt(pageBuffers) {
     '   - If no name is clearly in the header with associated ΑΦΜ, return null.',
     '',
     '4. Supplier TAX ID (ΑΦΜ ΠΡΟΜΗΘΕΥΤΗ):',
-    '   - The supplier ΑΦΜ is the 9-digit number in the document HEADER BLOCK (top of page).',
+    '   - The supplier ΑΦΜ is a 9-digit number in the document HEADER BLOCK (top of page).',
+    '     It may appear with an "EL" or "GR" country prefix (e.g., EL133778466). ALWAYS strip the prefix and return exactly 9 digits.',
     '   - It appears near/below the supplier company name, often with ΔΟΥ nearby.',
     '   - CRITICAL EXCLUSION RULE:',
     '     * Scan the OCR text for keywords: "ΣΤΟΙΧΕΙΑ ΠΕΛΑΤΗ", "ΣΤΟΙΧΕΙΑ ΑΠΟΣΤΟΛΗΣ", "ΕΠΩΝΥΜΙΑ ΠΕΛΑΤΗ", "ΠΕΛΑΤΗΣ".',
     '     * Any ΑΦΜ appearing AFTER these keywords is the CUSTOMER ΑΦΜ - do NOT use it.',
     '     * Only use an ΑΦΜ that appears BEFORE any customer section.',
     '   - If there more than 1 ΑΦΜ or Α.Φ.Μ. values, the FIRST one (reading top-to-bottom) is almost always the supplier.',
-    '   - Supplier ΑΦΜ must be exactly 9 digits.',
+    '   - After stripping any "EL"/"GR" prefix, the Greek supplier ΑΦΜ must be exactly 9 digits.',
     '',
     '5. Invoice Number (ΑΡΙΘΜΟΣ ΤΙΜΟΛΟΓΙΟΥ):',
     '   - Look for a table/row with columns: ΣΕΙΡΑ | ΑΡΙΘΜΟΣ | ΗΜΕΡΟΜΗΝΙΑ (or similar).',
@@ -374,7 +376,7 @@ async function runInvoiceOcrAttempt(pageBuffers) {
     '   - The supplier name is the company name in the FROM block (e.g., "MINDBODY, Inc.").',
     '',
     'F2. Supplier VAT Number/TAX ID (ΑΦΜ ΠΡΟΜΗΘΕΥΤΗ):',
-    '   - Foreign suppliers do not have a Greek ΑΦΜ (9-digit numeric).',
+    '   - Foreign suppliers do not have a Greek ΑΦΜ (9 digits, sometimes prefixed with "EL").',
     '   - Look for a VAT number instead (e.g., "VAT number", "VAT ID", "Tax ID", "VAT Reg No").',
     '   - Foreign VAT numbers are ALPHANUMERIC with a country prefix (e.g., IE3668997OH, DE123456789).',
     '   - If a VAT number is found, return it as-is in ΑΦΜ ΠΡΟΜΗΘΕΥΤΗ.',
@@ -406,7 +408,7 @@ async function runInvoiceOcrAttempt(pageBuffers) {
     '   - If the name looks garbled, prefer the reading that forms a plausible Greek surname or business name.',
     '',
     'R2. Supplier TAX ID (ΑΦΜ ΠΡΟΜΗΘΕΥΤΗ):',
-    '   - 9-digit number near the top, on or near a line containing "ΑΦΜ".',
+    '   - 9-digit number (possibly prefixed with "EL"/"GR" — strip the prefix) near the top, on or near a line containing "ΑΦΜ".',
     '   - Retail receipts have only ONE ΑΦΜ (the store) — there is no customer ΑΦΜ.',
     '',
     'R3. Receipt Number → ΑΡΙΘΜΟΣ ΤΙΜΟΛΟΓΙΟΥ:',
@@ -445,6 +447,7 @@ async function runInvoiceOcrAttempt(pageBuffers) {
     '\n\n⚠️ ΚΡΙΣΙΜΟΙ ΚΑΝΟΝΕΣ:\n' +
     '- ΑΦΜ ΠΡΟΜΗΘΕΥΤΗ: Χρησιμοποίησε ΜΟΝΟ το ΑΦΜ που εμφανίζεται ΠΡΙΝ από οποιοδήποτε "ΣΤΟΙΧΕΙΑ ΠΕΛΑΤΗ" ΚΑΙ ΣΤΟΙΧΕΙΑ ΑΠΟΣΤΟΛΗΣ.\n' +
     'Αν υπάρχουν πανω απο 1 ΑΦΜ, το ΠΡΩΤΟ (από πάνω προς τα κάτω) είναι του προμηθευτή.\n' +
+    'Αν το ΑΦΜ έχει πρόθεμα "EL" ή "GR" (π.χ. EL133778466), ΑΦΑΙΡΕΣΕ το πρόθεμα και επέστρεψε μόνο τα 9 ψηφία.\n' +
     '- ΑΡΙΘΜΟΣ ΤΙΜΟΛΟΓΙΟΥ: Χρησιμοποίησε τον αριθμό από τη στήλη "ΑΡΙΘΜΟΣ" (συνήθως δίπλα σε ΣΕΙΡΑ/ΗΜΕΡΟΜΗΝΙΑ). ' +
     'ΠΟΤΕ μην χρησιμοποιήσεις αριθμούς από "Σχετικά Παραστατικά" - αυτοί είναι αριθμοί αναφοράς.\n' +
     '\nΘυμήσου:\n' +
