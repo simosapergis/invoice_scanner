@@ -30,7 +30,7 @@ handle_error() {
 }
 trap 'handle_error ${LINENO} "$BASH_COMMAND"' ERR
 
-TOTAL_STEPS=13
+TOTAL_STEPS=14
 
 echo -e "${CYAN}=== Invoice Scanner - New Client Setup ===${NC}"
 echo -e "This script will create and provision a new Firebase/GCP project in europe-west3."
@@ -140,7 +140,7 @@ else
     mark_step_done "add_firebase"
 fi
 
-# ── 4. Set Active Project ──────────────────────────────────────────────────────
+# ── 5. Set Active Project ──────────────────────────────────────────────────────
 
 echo -e "[4/${TOTAL_STEPS}] Setting active Firebase project..."
 firebase use "$PROJECT_ID" >> "$LOG_FILE" 2>&1
@@ -162,7 +162,14 @@ else
         run.googleapis.com \
         artifactregistry.googleapis.com \
         identitytoolkit.googleapis.com \
+        pubsub.googleapis.com \
+        cloudscheduler.googleapis.com \
         --project "$PROJECT_ID" >> "$LOG_FILE" 2>&1
+
+    echo -e "  -> Provisioning service identities for Gen 2 Cloud Functions..."
+    gcloud beta services identity create --service=pubsub.googleapis.com --project="$PROJECT_ID" --quiet >> "$LOG_FILE" 2>&1
+    gcloud beta services identity create --service=eventarc.googleapis.com --project="$PROJECT_ID" --quiet >> "$LOG_FILE" 2>&1
+
     mark_step_done "enable_apis"
 fi
 
@@ -201,6 +208,19 @@ else
         gcloud app create --region=europe-west3 --project "$PROJECT_ID" >> "$LOG_FILE" 2>&1
         echo -e "  -> Created default bucket via App Engine initialization: $BUCKET_NAME"
     fi
+
+    echo -e "  -> Provisioning Firebase Storage default bucket..."
+    FB_BUCKET_RESPONSE=$(curl -s -X POST \
+        "https://firebasestorage.googleapis.com/v1alpha/projects/${PROJECT_ID}/defaultBucket" \
+        -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+        -H "Content-Type: application/json" \
+        -d "{\"location\":\"europe-west3\"}")
+    if [[ "$FB_BUCKET_RESPONSE" == *'"name"'* ]]; then
+        echo -e "  -> Provisioned Firebase Storage bucket: ${CYAN}gs://${PROJECT_ID}.firebasestorage.app${NC}"
+    else
+        echo -e "  ${YELLOW}-> Could not provision .firebasestorage.app bucket (may already exist or require console setup).${NC}"
+    fi
+
     mark_step_done "provision_storage"
 fi
 
@@ -235,12 +255,11 @@ else
 EOF
     gsutil cors set "$CORS_TEMP" "gs://${PROJECT_ID}.appspot.com" >> "$LOG_FILE" 2>&1
 
-    FIREBASE_STORAGE_CORS_OK=false
     if gsutil cors set "$CORS_TEMP" "gs://${PROJECT_ID}.firebasestorage.app" >> "$LOG_FILE" 2>&1; then
         FIREBASE_STORAGE_CORS_OK=true
     else
-        echo -e "  ${YELLOW}-> gs://${PROJECT_ID}.firebasestorage.app does not exist yet. Skipping CORS.${NC}"
-        echo -e "  ${YELLOW}   Re-run this step after enabling Firebase Storage in the console if needed.${NC}"
+        FIREBASE_STORAGE_CORS_OK=false
+        echo -e "  ${YELLOW}-> gs://${PROJECT_ID}.firebasestorage.app bucket not found. CORS skipped for it.${NC}"
     fi
     rm -f "$CORS_TEMP"
 
@@ -328,6 +347,36 @@ else
         --condition=None \
         >> "$LOG_FILE" 2>&1 || echo -e "  ${YELLOW}-> Warning: Failed to assign Cloud Run invoker role.${NC}"
 
+    echo -e "  ${CYAN}Gen 2 Storage-trigger & Pub/Sub roles:${NC}"
+
+    echo -e "  -> GCS SA: roles/pubsub.publisher ..."
+    gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+        --member="serviceAccount:service-${PROJECT_NUMBER}@gs-project-accounts.iam.gserviceaccount.com" \
+        --role="roles/pubsub.publisher" \
+        --condition=None \
+        >> "$LOG_FILE" 2>&1 || echo -e "  ${YELLOW}-> Warning: Failed to assign Pub/Sub publisher role to GCS SA.${NC}"
+
+    echo -e "  -> Pub/Sub SA: roles/iam.serviceAccountTokenCreator ..."
+    gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+        --member="serviceAccount:service-${PROJECT_NUMBER}@gcp-sa-pubsub.iam.gserviceaccount.com" \
+        --role="roles/iam.serviceAccountTokenCreator" \
+        --condition=None \
+        >> "$LOG_FILE" 2>&1 || echo -e "  ${YELLOW}-> Warning: Failed to assign token creator role to Pub/Sub SA.${NC}"
+
+    echo -e "  -> Compute default SA: roles/run.invoker ..."
+    gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+        --member="serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
+        --role="roles/run.invoker" \
+        --condition=None \
+        >> "$LOG_FILE" 2>&1 || echo -e "  ${YELLOW}-> Warning: Failed to assign Cloud Run invoker role to compute SA.${NC}"
+
+    echo -e "  -> Compute default SA: roles/eventarc.eventReceiver ..."
+    gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+        --member="serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
+        --role="roles/eventarc.eventReceiver" \
+        --condition=None \
+        >> "$LOG_FILE" 2>&1 || echo -e "  ${YELLOW}-> Warning: Failed to assign Eventarc event receiver role.${NC}"
+
     echo -e "  -> Waiting 30s for IAM propagation..."
     sleep 30
 
@@ -376,7 +425,7 @@ else
         -H "Content-Type: application/json" \
         -d '{"signIn":{"email":{"enabled":true,"passwordRequired":true}}}')
 
-    if echo "$AUTH_RESPONSE" | grep -q '"email"'; then
+    if [[ "$AUTH_RESPONSE" == *'"email"'* ]]; then
         echo -e "  -> Email/Password sign-in enabled."
     else
         echo -e "  ${YELLOW}-> Warning: Could not enable Email/Password sign-in automatically.${NC}"
@@ -405,7 +454,7 @@ else
                 -H "Content-Type: application/json" \
                 -d "{\"email\":\"${ADMIN_EMAIL}\",\"password\":\"${ADMIN_PASSWORD}\",\"displayName\":\"${ADMIN_DISPLAY_NAME}\"}")
 
-            if echo "$RESPONSE" | grep -q '"localId"'; then
+            if [[ "$RESPONSE" == *'"localId"'* ]]; then
                 LOCAL_ID=$(echo "$RESPONSE" | grep -o '"localId":"[^"]*"' | cut -d'"' -f4)
                 echo -e "  -> Created admin user: ${ADMIN_EMAIL} (UID: ${LOCAL_ID})"
             else
@@ -419,22 +468,78 @@ else
     mark_step_done "auth_setup"
 fi
 
-# ── 12. Deployment ──────────────────────────────────────────────────────────────
+# ── 13. Artifact Registry Cleanup Policy ──────────────────────────────────────
+
+if is_step_done "artifact_cleanup"; then
+    echo -e "[12/${TOTAL_STEPS}] Artifact Registry cleanup policy already set. Skipping..."
+else
+    echo -e "[12/${TOTAL_STEPS}] Configuring Artifact Registry cleanup policy..."
+
+    if ! gcloud artifacts repositories describe gcf-artifacts --location=europe-west3 --project="$PROJECT_ID" >> "$LOG_FILE" 2>&1; then
+        gcloud artifacts repositories create gcf-artifacts \
+            --repository-format=docker \
+            --location=europe-west3 \
+            --project="$PROJECT_ID" \
+            --quiet >> "$LOG_FILE" 2>&1
+        echo -e "  -> Created gcf-artifacts repository in europe-west3"
+    fi
+
+    CLEANUP_POLICY_TEMP=$(mktemp)
+    cat > "$CLEANUP_POLICY_TEMP" << 'POLICY_EOF'
+[
+  {
+    "name": "delete-old-images",
+    "action": {"type": "Delete"},
+    "condition": {
+      "olderThan": "86400s"
+    }
+  }
+]
+POLICY_EOF
+    gcloud artifacts repositories set-cleanup-policies gcf-artifacts \
+        --location=europe-west3 \
+        --project="$PROJECT_ID" \
+        --policy="$CLEANUP_POLICY_TEMP" \
+        --quiet >> "$LOG_FILE" 2>&1
+    rm -f "$CLEANUP_POLICY_TEMP"
+    echo -e "  -> Cleanup policy set: images older than 1 day auto-deleted"
+
+    mark_step_done "artifact_cleanup"
+fi
+
+# ── 14. Deployment ─────────────────────────────────────────────────────────────
 
 if is_step_done "deployment"; then
-    echo -e "[12/${TOTAL_STEPS}] Deployment already completed. Skipping..."
+    echo -e "[13/${TOTAL_STEPS}] Deployment already completed. Skipping..."
 else
-    echo -e "[12/${TOTAL_STEPS}] Deploying Cloud Functions (this may take a few minutes)..."
-    firebase deploy --only functions --project "$PROJECT_ID" --non-interactive --force >> "$LOG_FILE" 2>&1
+    echo -e "[13/${TOTAL_STEPS}] Deploying Cloud Functions (this may take a few minutes)..."
+    DEPLOY_MAX_RETRIES=3
+    DEPLOY_ATTEMPT=0
+    DEPLOY_OK=false
+    while [ "$DEPLOY_ATTEMPT" -lt "$DEPLOY_MAX_RETRIES" ]; do
+        DEPLOY_ATTEMPT=$((DEPLOY_ATTEMPT + 1))
+        if firebase deploy --only functions --project "$PROJECT_ID" --non-interactive --force >> "$LOG_FILE" 2>&1; then
+            DEPLOY_OK=true
+            break
+        fi
+        if [ "$DEPLOY_ATTEMPT" -lt "$DEPLOY_MAX_RETRIES" ]; then
+            echo -e "  ${YELLOW}-> Deploy attempt ${DEPLOY_ATTEMPT}/${DEPLOY_MAX_RETRIES} had errors. Retrying in 30s (partial deploys will be skipped)...${NC}"
+            sleep 30
+        fi
+    done
+    if [ "$DEPLOY_OK" = false ]; then
+        echo -e "  ${RED}-> All ${DEPLOY_MAX_RETRIES} deploy attempts failed. Check ${LOG_FILE} for details.${NC}"
+        exit 1
+    fi
     mark_step_done "deployment"
 fi
 
-# ── 13. Register Firebase Web App & Export Config ──────────────────────────────
+# ── 15. Register Firebase Web App & Export Config ──────────────────────────────
 
 if is_step_done "register_web_app"; then
-    echo -e "[13/${TOTAL_STEPS}] Firebase Web App already registered. Skipping..."
+    echo -e "[14/${TOTAL_STEPS}] Firebase Web App already registered. Skipping..."
 else
-    echo -e "[13/${TOTAL_STEPS}] Registering Firebase Web App & exporting config..."
+    echo -e "[14/${TOTAL_STEPS}] Registering Firebase Web App & exporting config..."
 
     EXISTING_APP=$(firebase apps:list WEB --project "$PROJECT_ID" 2>/dev/null | grep -c "App ID" || true)
     if [ "$EXISTING_APP" -gt 0 ]; then
