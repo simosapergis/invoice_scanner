@@ -29,6 +29,7 @@ import { HTTP_OPTS, requireMethod, sendError } from './lib/http-utils.js';
 
 import {
   sanitizeFilename,
+  sanitizeId,
   normalizeTotalPages,
   normalizePageNumber,
   padPageNumber,
@@ -41,7 +42,7 @@ import { processInvoiceDocumentHandler } from './lib/invoice-processor.js';
 
 import { validatePaymentRequest, derivePaymentStatus, validateUpdateFieldsRequest } from './lib/payments.js';
 
-import { validateUpdateSupplierRequest } from './lib/suppliers.js';
+import { validateUpdateSupplierRequest, migrateSupplier } from './lib/suppliers.js';
 
 import {
   FINANCIAL_ENTRIES_COLLECTION,
@@ -616,18 +617,70 @@ export const updateSupplierFields_v2 = onRequest(HTTP_OPTS, async (req, res) => 
   }
 
   const { supplierId, fields } = body;
-  const supplierRef = db.collection('suppliers').doc(supplierId);
+
+  // Detect whether the tax-number change triggers a supplier-ID migration
+  const newSupplierId =
+    fields.supplierTaxNumber !== undefined
+      ? sanitizeId(fields.supplierTaxNumber, supplierId)
+      : null;
+  const needsMigration = newSupplierId && newSupplierId !== supplierId;
 
   try {
+    if (needsMigration) {
+      // Build the full update payload for the migrated supplier doc
+      const supplierUpdates = {
+        supplierTaxNumber: fields.supplierTaxNumber,
+        lastEditedBy: user.uid,
+        lastEditedByName: getUserDisplayName(user),
+        lastEditedAt: admin.firestore.FieldValue.serverTimestamp(),
+      };
+      const updatedFields = ['supplierTaxNumber'];
+
+      if (fields.name !== undefined) {
+        supplierUpdates.name = fields.name;
+        updatedFields.push('name');
+      }
+      if (fields.supplierCategory !== undefined) {
+        supplierUpdates.supplierCategory = fields.supplierCategory;
+        updatedFields.push('supplierCategory');
+      }
+      if (fields.delivery !== undefined) {
+        supplierUpdates.delivery = {
+          dayOfWeek: fields.delivery.dayOfWeek,
+          from: { hour: fields.delivery.from?.hour, minute: fields.delivery.from?.minute },
+          to: { hour: fields.delivery.to?.hour, minute: fields.delivery.to?.minute },
+        };
+        updatedFields.push('delivery');
+      }
+
+      const { migratedInvoices } = await migrateSupplier({
+        oldSupplierId: supplierId,
+        newSupplierId,
+        supplierUpdates,
+      });
+
+      console.log(
+        `Supplier migrated ${supplierId} → ${newSupplierId} (${migratedInvoices} invoice(s)):`,
+        updatedFields
+      );
+
+      return res.status(200).json({
+        success: true,
+        message: `Μετεγκατάσταση προμηθευτή ${supplierId} → ${newSupplierId} (${migratedInvoices} τιμολόγια). Ενημερώθηκαν: ${updatedFields.join(', ')}`,
+        data: { oldSupplierId: supplierId, supplierId: newSupplierId, updatedFields, migratedInvoices },
+      });
+    }
+
+    // Standard in-place update (no ID change)
+    const supplierRef = db.collection('suppliers').doc(supplierId);
+
     const result = await db.runTransaction(async (tx) => {
       const supplierSnap = await tx.get(supplierRef);
 
-      // 3. Check supplier exists
       if (!supplierSnap.exists) {
         throw Object.assign(new Error(`Supplier not found: suppliers/${supplierId}`), { httpStatus: 404 });
       }
 
-      // 4. Build update object
       const updates = {
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         lastEditedBy: user.uid,
@@ -637,7 +690,6 @@ export const updateSupplierFields_v2 = onRequest(HTTP_OPTS, async (req, res) => 
 
       const updatedFields = [];
 
-      // Process string fields
       if (fields.name !== undefined) {
         updates.name = fields.name;
         updatedFields.push('name');
@@ -653,29 +705,18 @@ export const updateSupplierFields_v2 = onRequest(HTTP_OPTS, async (req, res) => 
         updatedFields.push('supplierTaxNumber');
       }
 
-      // Process delivery object
       if (fields.delivery !== undefined) {
         updates.delivery = {
           dayOfWeek: fields.delivery.dayOfWeek,
-          from: {
-            hour: fields.delivery.from?.hour,
-            minute: fields.delivery.from?.minute,
-          },
-          to: {
-            hour: fields.delivery.to?.hour,
-            minute: fields.delivery.to?.minute,
-          },
+          from: { hour: fields.delivery.from?.hour, minute: fields.delivery.from?.minute },
+          to: { hour: fields.delivery.to?.hour, minute: fields.delivery.to?.minute },
         };
         updatedFields.push('delivery');
       }
 
-      // 5. Update supplier document
       tx.update(supplierRef, updates);
 
-      return {
-        supplierId,
-        updatedFields,
-      };
+      return { supplierId, updatedFields };
     });
 
     console.log(`Supplier fields updated for ${supplierId}:`, result.updatedFields);

@@ -1,6 +1,9 @@
-import { db, serverTimestamp } from './config.js';
+import { db, storage, serverTimestamp, getBucketName, METADATA_INVOICE_COLLECTION } from './config.js';
+import { FINANCIAL_ENTRIES_COLLECTION } from './financial.js';
 
 const EDITABLE_SUPPLIER_FIELDS = ['name', 'supplierCategory', 'supplierTaxNumber', 'delivery'];
+
+const MAX_BATCH_OPS = 500;
 
 async function ensureSupplierProfile({ supplierId, supplierName, supplierTaxNumber, supplierCategory, missingTaxNumber }) {
   if (!supplierId) {
@@ -134,12 +137,12 @@ function validateUpdateSupplierRequest(body) {
     errors.push('fields.supplierCategory must be a string');
   }
 
-  // Validate supplierTaxNumber (string with numbers only)
+  // Validate supplierTaxNumber (alphanumeric, 2-17 chars — covers Greek AFM + EU VAT with country prefix)
   if (fields.supplierTaxNumber !== undefined) {
     if (typeof fields.supplierTaxNumber !== 'string') {
       errors.push('fields.supplierTaxNumber must be a string');
-    } else if (!/^\d+$/.test(fields.supplierTaxNumber)) {
-      errors.push('fields.supplierTaxNumber must contain only digits');
+    } else if (!/^[A-Za-z0-9]{2,17}$/.test(fields.supplierTaxNumber)) {
+      errors.push('fields.supplierTaxNumber must be 2-17 alphanumeric characters');
     }
   }
 
@@ -158,10 +161,228 @@ function validateUpdateSupplierRequest(body) {
   return errors;
 }
 
+/**
+ * Migrates a supplier to a new document ID (triggered by tax number change).
+ * Copies all invoices, GCS PDFs, and updates cross-references.
+ *
+ * @param {Object} params
+ * @param {string} params.oldSupplierId - Current Firestore document ID
+ * @param {string} params.newSupplierId - Target Firestore document ID
+ * @param {Object} params.supplierUpdates - Fields to set/merge on the new supplier doc
+ * @returns {Promise<{ migratedInvoices: number }>}
+ */
+async function migrateSupplier({ oldSupplierId, newSupplierId, supplierUpdates }) {
+  const bucketName = getBucketName();
+  const bucket = storage.bucket(bucketName);
+
+  const oldSupplierRef = db.collection('suppliers').doc(oldSupplierId);
+  const newSupplierRef = db.collection('suppliers').doc(newSupplierId);
+
+  // 1. Read old supplier data, target supplier (if exists), and all invoices
+  const [oldSupplierSnap, newSupplierSnap, invoicesSnap] = await Promise.all([
+    oldSupplierRef.get(),
+    newSupplierRef.get(),
+    oldSupplierRef.collection('invoices').get(),
+  ]);
+
+  if (!oldSupplierSnap.exists) {
+    throw Object.assign(
+      new Error(`Supplier not found: suppliers/${oldSupplierId}`),
+      { httpStatus: 404 }
+    );
+  }
+
+  const oldSupplierData = oldSupplierSnap.data();
+  const invoiceDocs = invoicesSnap.docs;
+
+  // 2. Copy GCS files (server-side, parallel) — collect results for cleanup
+  const gcsOps = invoiceDocs.map(async (invoiceDoc) => {
+    const data = invoiceDoc.data();
+    if (!data.filePath) return { oldPath: null, newPath: null };
+
+    const newFilePath = data.filePath.replace(
+      `suppliers/${oldSupplierId}/`,
+      `suppliers/${newSupplierId}/`
+    );
+
+    try {
+      await bucket.file(data.filePath).copy(bucket.file(newFilePath));
+    } catch (err) {
+      console.warn(
+        `GCS copy failed for ${data.filePath} → ${newFilePath}:`,
+        err.message
+      );
+    }
+
+    return { oldPath: data.filePath, newPath: newFilePath };
+  });
+
+  const gcsPaths = await Promise.all(gcsOps);
+
+  // 3. Batched Firestore write: create/merge target supplier, copy invoices, delete old docs
+  const targetExists = newSupplierSnap.exists;
+
+  let mergedSupplierData;
+  const PROFILE_FIELDS = ['name', 'supplierCategory', 'delivery'];
+
+  if (targetExists) {
+    // Target exists — preserve its profile; only apply audit metadata + tax number
+    const auditOnly = Object.fromEntries(
+      Object.entries(supplierUpdates).filter(([k]) => !PROFILE_FIELDS.includes(k))
+    );
+    mergedSupplierData = {
+      ...newSupplierSnap.data(),
+      ...auditOnly,
+      missingTaxNumber: false,
+      updatedAt: serverTimestamp(),
+    };
+  } else {
+    mergedSupplierData = {
+      ...oldSupplierData,
+      ...supplierUpdates,
+      missingTaxNumber: false,
+      updatedAt: serverTimestamp(),
+    };
+  }
+  delete mergedSupplierData.createdAt;
+
+  const canonicalName = targetExists
+    ? (newSupplierSnap.data().name || oldSupplierData.name)
+    : (supplierUpdates.name || oldSupplierData.name);
+
+  const allOps = [];
+  allOps.push({ type: 'set', ref: newSupplierRef, data: mergedSupplierData, opts: { merge: true } });
+
+  for (let i = 0; i < invoiceDocs.length; i++) {
+    const invoiceDoc = invoiceDocs[i];
+    const data = invoiceDoc.data();
+    const newFilePath = gcsPaths[i].newPath || data.filePath;
+    const newInvoiceRef = newSupplierRef.collection('invoices').doc(invoiceDoc.id);
+
+    allOps.push({
+      type: 'set',
+      ref: newInvoiceRef,
+      data: {
+        ...data,
+        supplierId: newSupplierId,
+        supplierTaxNumber: supplierUpdates.supplierTaxNumber ?? data.supplierTaxNumber,
+        supplierName: canonicalName,
+        filePath: newFilePath,
+      },
+    });
+    allOps.push({ type: 'delete', ref: oldSupplierRef.collection('invoices').doc(invoiceDoc.id) });
+  }
+
+  allOps.push({ type: 'delete', ref: oldSupplierRef });
+
+  await commitInBatches(allOps);
+
+  // 4. Update cross-references in metadata_invoices and financial_entries
+  await Promise.all([
+    updateMetadataInvoiceRefs(oldSupplierId, newSupplierId),
+    updateFinancialEntryRefs(oldSupplierId, newSupplierId),
+  ]);
+
+  // 5. Clean up old GCS files (best-effort, after Firestore is consistent)
+  const deletions = gcsPaths
+    .filter((p) => p.oldPath && p.newPath && p.oldPath !== p.newPath)
+    .map((p) => bucket.file(p.oldPath).delete().catch((err) => {
+      console.warn(`GCS delete failed for ${p.oldPath}:`, err.message);
+    }));
+  await Promise.all(deletions);
+
+  return { migratedInvoices: invoiceDocs.length };
+}
+
+/**
+ * Commits an array of { type, ref, data, opts } operations in batches of 500.
+ */
+async function commitInBatches(ops) {
+  for (let i = 0; i < ops.length; i += MAX_BATCH_OPS) {
+    const batch = db.batch();
+    const chunk = ops.slice(i, i + MAX_BATCH_OPS);
+
+    for (const op of chunk) {
+      if (op.type === 'set') {
+        batch.set(op.ref, op.data, op.opts || {});
+      } else if (op.type === 'delete') {
+        batch.delete(op.ref);
+      }
+    }
+
+    await batch.commit();
+  }
+}
+
+async function updateMetadataInvoiceRefs(oldId, newId) {
+  const oldPathPrefix = `suppliers/${oldId}/`;
+  const newPathPrefix = `suppliers/${newId}/`;
+
+  // Update docs where detectedSupplierId matches
+  const detectedQuery = await db
+    .collection(METADATA_INVOICE_COLLECTION)
+    .where('detectedSupplierId', '==', oldId)
+    .get();
+
+  // Update docs where processedInvoicePath starts with old prefix.
+  // Firestore has no startsWith — use range query on string ordering.
+  const pathQuery = await db
+    .collection(METADATA_INVOICE_COLLECTION)
+    .where('processedInvoicePath', '>=', oldPathPrefix)
+    .where('processedInvoicePath', '<', oldPathPrefix + '\uf8ff')
+    .get();
+
+  // De-duplicate in case the same doc matches both queries
+  const docsById = new Map();
+  for (const snap of [...detectedQuery.docs, ...pathQuery.docs]) {
+    if (!docsById.has(snap.id)) docsById.set(snap.id, snap);
+  }
+
+  if (docsById.size === 0) return;
+
+  const ops = [];
+  for (const [, snap] of docsById) {
+    const data = snap.data();
+    const updates = {};
+
+    if (data.detectedSupplierId === oldId) {
+      updates.detectedSupplierId = newId;
+    }
+    if (data.processedInvoicePath?.startsWith(oldPathPrefix)) {
+      updates.processedInvoicePath = newPathPrefix + data.processedInvoicePath.slice(oldPathPrefix.length);
+    }
+
+    if (Object.keys(updates).length > 0) {
+      ops.push({ type: 'set', ref: snap.ref, data: updates, opts: { merge: true } });
+    }
+  }
+
+  await commitInBatches(ops);
+}
+
+async function updateFinancialEntryRefs(oldId, newId) {
+  const querySnap = await db
+    .collection(FINANCIAL_ENTRIES_COLLECTION)
+    .where('supplierId', '==', oldId)
+    .get();
+
+  if (querySnap.empty) return;
+
+  const ops = querySnap.docs.map((snap) => ({
+    type: 'set',
+    ref: snap.ref,
+    data: { supplierId: newId },
+    opts: { merge: true },
+  }));
+
+  await commitInBatches(ops);
+}
+
 export {
   EDITABLE_SUPPLIER_FIELDS,
   ensureSupplierProfile,
   validateTimeObject,
   validateDeliveryObject,
   validateUpdateSupplierRequest,
+  migrateSupplier,
 };

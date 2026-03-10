@@ -34,7 +34,7 @@ Think like a **Principal GCP Architect**. Evaluate every decision through GCP-na
 - `lib/invoice-pdf.js` — `convertBufferToPdf`, `buildCombinedPdfFromPages`.
 - `lib/invoice-processor.js` — `processInvoiceDocumentHandler` (lock, OCR, dedup, supplier upsert, Firestore writes); PDF vs image branching.
 - `lib/payments.js` — `validatePaymentRequest`, `derivePaymentStatus`, `validateUpdateFieldsRequest`.
-- `lib/suppliers.js` — `validateUpdateSupplierRequest`, `validateDeliveryObject`, `validateTimeObject`.
+- `lib/suppliers.js` — `validateUpdateSupplierRequest`, `validateDeliveryObject`, `validateTimeObject`, `migrateSupplier` (tax-ID change → full supplier re-key).
 - `lib/financial.js` — `ENTRY_TYPE`, `EXPENSE_CATEGORY`, `buildFinancialEntry`, `validateFinancialEntryRequest`, `validateUpdateFinancialEntryRequest`.
 - `lib/recurring.js` — `validateRecurringExpenseRequest`.
 - `lib/invoice-export.js` — `validateExportRequest`, `fetchInvoiceDocuments`, `recordDownloads`, `streamInvoicesZip`, `getExportDownloadUrl`.
@@ -98,6 +98,7 @@ Think like a **Principal GCP Architect**. Evaluate every decision through GCP-na
 - **Secrets**: `.env` files and shell scripts — never commit.
 - **Display name denormalization**: every UID audit field (e.g. `createdBy`) has a `*Name` companion via `getUserDisplayName(decodedToken)` (fallback: `name` → `email` → `uid`). Names ride the ID token; historical records are immutable.
 - **Timezone**: For Athens-local dates use `getAthensToday()` / `formatAthensDate()` from `lib/config.js`. Store dates as UTC; convert to `Europe/Athens` only at boundaries.
+- **Supplier tax-ID migration**: changing `supplierTaxNumber` via `updateSupplierFields_v2` when it produces a different `sanitizeId()` triggers `migrateSupplier` — moves supplier doc, invoices subcollection (with updated `supplierId`/`filePath`), GCS PDFs, and cross-references in `metadata_invoices` + `financial_entries` to the new `suppliers/{newId}` path; merges if target exists; deletes old doc.
 - **Legacy**: `functions.config.json` is a v1 dump, unused by v2.
 
 ## 7. Security Rules
