@@ -1,7 +1,7 @@
 import archiver from 'archiver';
 import { PassThrough } from 'stream';
 import { pipeline } from 'stream/promises';
-import { admin, db, storage, getBucketName, SIGNED_URL_TTL_MS, serverTimestamp } from './config.js';
+import { admin, db, storage, getBucketName, SIGNED_URL_TTL_MS, serverTimestamp, formatAthensDate } from './config.js';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -156,7 +156,7 @@ function sanitizeZipEntryName(invoice) {
       ? invoice.invoiceDate.toDate()
       : new Date(invoice.invoiceDate);
     if (!isNaN(date.getTime())) {
-      parts.push(date.toISOString().slice(0, 10));
+      parts.push(formatAthensDate(date));
     }
   }
 

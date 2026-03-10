@@ -85,6 +85,62 @@ function validateFinancialEntryRequest(body) {
   return errors;
 }
 
+const EDITABLE_ENTRY_FIELDS = ['type', 'category', 'amount', 'date', 'description'];
+
+/**
+ * Validates update financial entry request (partial field updates)
+ */
+function validateUpdateFinancialEntryRequest(body) {
+  const errors = [];
+
+  if (!body.entryId || typeof body.entryId !== 'string') {
+    errors.push('entryId is required and must be a string');
+  }
+
+  if (!body.fields || typeof body.fields !== 'object' || Array.isArray(body.fields)) {
+    errors.push('fields is required and must be an object');
+    return errors;
+  }
+
+  const fields = body.fields;
+  const providedKeys = Object.keys(fields);
+
+  const unknownFields = providedKeys.filter((k) => !EDITABLE_ENTRY_FIELDS.includes(k));
+  if (unknownFields.length > 0) {
+    errors.push(`Unknown fields: ${unknownFields.join(', ')}. Allowed: ${EDITABLE_ENTRY_FIELDS.join(', ')}`);
+  }
+
+  const validKeys = providedKeys.filter((k) => EDITABLE_ENTRY_FIELDS.includes(k));
+  if (validKeys.length === 0) {
+    errors.push('At least one field to update must be provided');
+  }
+
+  if (fields.type !== undefined && !Object.values(ENTRY_TYPE).includes(fields.type)) {
+    errors.push(`type must be one of: ${Object.values(ENTRY_TYPE).join(', ')}`);
+  }
+
+  if (fields.amount !== undefined && (typeof fields.amount !== 'number' || fields.amount <= 0)) {
+    errors.push('amount must be a positive number');
+  }
+
+  if (fields.date !== undefined) {
+    if (!fields.date || typeof fields.date !== 'string') {
+      errors.push('date must be a valid ISO date string');
+    } else {
+      const date = new Date(fields.date);
+      if (isNaN(date.getTime())) {
+        errors.push('date must be a valid ISO date string');
+      }
+    }
+  }
+
+  if (fields.description !== undefined && fields.description !== null && typeof fields.description !== 'string') {
+    errors.push('description must be a string or null');
+  }
+
+  return errors;
+}
+
 /**
  * Creates a financial entry document
  */
@@ -114,6 +170,8 @@ export {
   EXPENSE_CATEGORY,
   VALID_INCOME_CATEGORIES,
   VALID_EXPENSE_CATEGORIES,
+  EDITABLE_ENTRY_FIELDS,
   validateFinancialEntryRequest,
+  validateUpdateFinancialEntryRequest,
   buildFinancialEntry,
 };

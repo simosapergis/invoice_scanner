@@ -25,7 +25,7 @@ Think like a **Principal GCP Architect**. Evaluate every decision through GCP-na
 ## 2. Architecture
 
 **Cloud Functions** in `functions/`, modularized:
-- `index.js` (~1250 lines) — handler wiring, all Cloud Function exports.
+- `index.js` — handler wiring, all Cloud Function exports.
 - `lib/config.js` — `admin.initializeApp()`, `defineString` params, shared constants.
 - `lib/auth.js` — `authenticateRequest`, `extractBearerToken`, `getUserDisplayName`.
 - `lib/http-utils.js` — `HTTP_OPTS` (includes `invoker: 'public'` for CORS preflight; auth via `authenticateRequest`), `requireMethod`, `sendError`.
@@ -35,7 +35,7 @@ Think like a **Principal GCP Architect**. Evaluate every decision through GCP-na
 - `lib/invoice-processor.js` — `processInvoiceDocumentHandler` (lock, OCR, dedup, supplier upsert, Firestore writes); PDF vs image branching.
 - `lib/payments.js` — `validatePaymentRequest`, `derivePaymentStatus`, `validateUpdateFieldsRequest`.
 - `lib/suppliers.js` — `validateUpdateSupplierRequest`, `validateDeliveryObject`, `validateTimeObject`.
-- `lib/financial.js` — `ENTRY_TYPE`, `EXPENSE_CATEGORY`, `buildFinancialEntry`, `validateFinancialEntryRequest`.
+- `lib/financial.js` — `ENTRY_TYPE`, `EXPENSE_CATEGORY`, `buildFinancialEntry`, `validateFinancialEntryRequest`, `validateUpdateFinancialEntryRequest`.
 - `lib/recurring.js` — `validateRecurringExpenseRequest`.
 - `lib/invoice-export.js` — `validateExportRequest`, `fetchInvoiceDocuments`, `recordDownloads`, `streamInvoicesZip`, `getExportDownloadUrl`.
 
@@ -92,10 +92,12 @@ Think like a **Principal GCP Architect**. Evaluate every decision through GCP-na
 - **Multi-page OCR optimization**: >2 pages → only first + last sent to OCR. Images: filtered in `runInvoiceOcr`. PDFs: via Vision `pages` parameter.
 - **PDF dual-path**: single PDF upload → skip `buildCombinedPdfFromPages`; GCS `file.copy()` + `batchAnnotateFiles` from URI.
 - **GCS CORS**: generated dynamically by `setup_new_client.sh` using `$PROJECT_ID` for origins; applied to both `.appspot.com` and `.firebasestorage.app` buckets.
+- **Financial entry edits**: `editFinancialEntry_v2` — manual + recurring only; `invoice_payment` is read-only. Recurring cannot change `type`.
 - **Dedup**: same supplier + invoice number with `processingStatus === 'uploaded'` = duplicate.
 - **European decimals**: comma separator (e.g., `1.234,56`). `normalizeEuropeanDecimals` before parsing.
 - **Secrets**: `.env` files and shell scripts — never commit.
-- **Display name denormalization**: every UID audit field (e.g. `createdBy`) has a `*Name` companion (e.g. `createdByName`) populated via `getUserDisplayName(decodedToken)` (fallback: `name` → `email` → `uid`). Names ride the ID token at zero Firestore cost; historical records are immutable.
+- **Display name denormalization**: every UID audit field (e.g. `createdBy`) has a `*Name` companion via `getUserDisplayName(decodedToken)` (fallback: `name` → `email` → `uid`). Names ride the ID token; historical records are immutable.
+- **Timezone**: For Athens-local dates use `getAthensToday()` / `formatAthensDate()` from `lib/config.js`. Store dates as UTC; convert to `Europe/Athens` only at boundaries.
 - **Legacy**: `functions.config.json` is a v1 dump, unused by v2.
 
 ## 7. Security Rules
@@ -115,15 +117,14 @@ Think like a **Principal GCP Architect**. Evaluate every decision through GCP-na
 - `_v2` suffix on new Cloud Functions.
 - `// ═══` banner style for new `index.js` sections.
 - Dedicated validator for each new endpoint.
+- `getAthensToday()` / `formatAthensDate()` for any Athens-local date logic. Never derive calendar dates from raw `new Date()`.
 - Unit tests for every new helper/validator/business-logic function (`functions/test/<module>.test.js`). New uncovered code MUST get tests.
 - Run `npm run lint` + `npm test` in `functions/` after every change. Fix failures before completing.
 - **Keep this file current**: after any addition or change, evaluate if `AGENTS.md` needs updating and do so in the same task.
 - **Keep this file concise** (target ≤ 130 lines). When adding content, tighten or restructure to stay within the limit. Always adhere to the practices documented here.
 
 **Don't:**
-- `functions.config()` (Gen 1 API).
-- Modify `update-env-*.sh` (secrets context).
-- Commit `.env` files or API keys.
+- `functions.config()` (Gen 1 API). Modify `update-env-*.sh` (secrets context). Commit `.env` files or API keys.
 - `Co-authored-by` or other trailers in commit messages.
 
 **When solving any problem, think always step by step and better be sure with your solution**

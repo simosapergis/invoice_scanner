@@ -47,6 +47,21 @@ function getBucketName() {
   return GCS_BUCKET.value();
 }
 
+const ATHENS_TZ = 'Europe/Athens';
+const athensDateFormatter = new Intl.DateTimeFormat('en-CA', {
+  timeZone: ATHENS_TZ,
+});
+
+function getAthensToday() {
+  const dateStr = athensDateFormatter.format(new Date());
+  const [y, m, d] = dateStr.split('-').map(Number);
+  return { utcDate: new Date(Date.UTC(y, m - 1, d)), dayOfMonth: d };
+}
+
+function formatAthensDate(date) {
+  return athensDateFormatter.format(date);
+}
+
 export {
   admin,
   db,
@@ -63,4 +78,6 @@ export {
   PAYMENT_STATUS,
   serverTimestamp,
   getBucketName,
+  getAthensToday,
+  formatAthensDate,
 };

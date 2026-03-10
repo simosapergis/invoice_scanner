@@ -21,6 +21,7 @@ import {
   PAYMENT_STATUS,
   serverTimestamp,
   getBucketName,
+  getAthensToday,
 } from './lib/config.js';
 
 import { authenticateRequest, getUserDisplayName } from './lib/auth.js';
@@ -48,7 +49,10 @@ import {
   ENTRY_TYPE,
   ENTRY_SOURCE,
   EXPENSE_CATEGORY,
+  VALID_INCOME_CATEGORIES,
+  VALID_EXPENSE_CATEGORIES,
   validateFinancialEntryRequest,
+  validateUpdateFinancialEntryRequest,
   buildFinancialEntry,
 } from './lib/financial.js';
 
@@ -827,6 +831,120 @@ export const addFinancialEntry_v2 = onRequest(HTTP_OPTS, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// EDIT FINANCIAL ENTRY
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Edits a manual or recurring financial entry. Invoice payment entries are
+// read-only. Soft-deleted entries cannot be edited.
+//
+// Request Body:
+// {
+//   entryId: string,
+//   fields: {
+//     type?: "income" | "expense",   // Manual only
+//     category?: string,
+//     amount?: number,
+//     date?: string,                 // ISO date string
+//     description?: string | null
+//   }
+// }
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Blue-green deployment: v2 functions run alongside v1
+// Old function name: editFinancialEntry
+export const editFinancialEntry_v2 = onRequest(HTTP_OPTS, async (req, res) => {
+  if (!requireMethod(req, res, 'POST')) return;
+
+  const authResult = await authenticateRequest(req);
+  if (authResult.error) {
+    return sendError(res, authResult.status, authResult.error);
+  }
+  const user = authResult.user;
+
+  const body = req.body || {};
+  const validationErrors = validateUpdateFinancialEntryRequest(body);
+  if (validationErrors.length > 0) {
+    return sendError(res, 400, 'Validation failed', { details: validationErrors });
+  }
+
+  const { entryId, fields } = body;
+
+  try {
+    const entryRef = db.collection(FINANCIAL_ENTRIES_COLLECTION).doc(entryId);
+    const entrySnap = await entryRef.get();
+
+    if (!entrySnap.exists) {
+      return sendError(res, 404, 'Η εγγραφή δεν βρέθηκε');
+    }
+
+    const current = entrySnap.data();
+
+    if (current.isDeleted) {
+      return sendError(res, 400, 'Δεν μπορείτε να επεξεργαστείτε διαγραμμένες εγγραφές');
+    }
+
+    if (current.source === ENTRY_SOURCE.invoicePayment) {
+      return sendError(res, 400, 'Δεν μπορείτε να επεξεργαστείτε εγγραφές πληρωμών τιμολογίων');
+    }
+
+    if (current.source === ENTRY_SOURCE.recurring && fields.type !== undefined) {
+      return sendError(res, 400, 'Δεν μπορείτε να αλλάξετε τον τύπο σε πάγια έξοδα');
+    }
+
+    // Determine effective type for category validation
+    const effectiveType = fields.type ?? current.type;
+
+    // If type is changing, category must also be provided
+    if (fields.type !== undefined && fields.type !== current.type && fields.category === undefined) {
+      const validCategories =
+        effectiveType === ENTRY_TYPE.income ? VALID_INCOME_CATEGORIES : VALID_EXPENSE_CATEGORIES;
+      if (!validCategories.includes(current.category)) {
+        return sendError(res, 400, 'Πρέπει να δώσετε κατηγορία όταν αλλάζετε τον τύπο', {
+          details: [`category is required when changing type to ${effectiveType}`],
+        });
+      }
+    }
+
+    // Validate category against effective type
+    if (fields.category !== undefined) {
+      const validCategories =
+        effectiveType === ENTRY_TYPE.income ? VALID_INCOME_CATEGORIES : VALID_EXPENSE_CATEGORIES;
+      if (!validCategories.includes(fields.category)) {
+        return sendError(res, 400, 'Validation failed', {
+          details: [`category for ${effectiveType} must be one of: ${validCategories.join(', ')}`],
+        });
+      }
+    }
+
+    // Build update object
+    const updates = {
+      updatedAt: serverTimestamp(),
+      updatedBy: user.uid,
+      updatedByName: getUserDisplayName(user),
+    };
+
+    if (fields.type !== undefined) updates.type = fields.type;
+    if (fields.category !== undefined) updates.category = fields.category;
+    if (fields.amount !== undefined) updates.amount = fields.amount;
+    if (fields.date !== undefined) updates.date = admin.firestore.Timestamp.fromDate(new Date(fields.date));
+    if (fields.description !== undefined) updates.description = fields.description === null ? null : fields.description;
+
+    await entryRef.update(updates);
+
+    console.log(`Financial entry updated: ${entryId}`);
+
+    return res.status(200).json({
+      success: true,
+      message: 'Η εγγραφή ενημερώθηκε επιτυχώς',
+      data: { entryId, updatedFields: Object.keys(fields) },
+    });
+  } catch (error) {
+    console.error('Failed to update financial entry:', error);
+    return sendError(res, 500, 'Failed to update financial entry', { details: error.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // DELETE FINANCIAL ENTRY (Soft Delete)
 // ═══════════════════════════════════════════════════════════════════════════════
 //
@@ -914,9 +1032,8 @@ export const getFinancialReport_v2 = onRequest(HTTP_OPTS, async (req, res) => {
     return sendError(res, 400, 'startDate and endDate are required');
   }
 
-  const start = new Date(startDate);
-  const end = new Date(endDate);
-  end.setHours(23, 59, 59, 999); // Include entire end day
+  const start = new Date(startDate + 'T00:00:00Z');
+  const end = new Date(endDate + 'T23:59:59.999Z');
 
   if (isNaN(start.getTime()) || isNaN(end.getTime())) {
     return sendError(res, 400, 'Invalid date format');
@@ -1165,8 +1282,7 @@ export const processRecurringExpenses_v2 = onSchedule(
     timeZone: 'Europe/Athens',
   },
   async (_event) => {
-    const today = new Date();
-    const dayOfMonth = today.getDate();
+    const { utcDate: today, dayOfMonth } = getAthensToday();
 
     console.log(`Processing recurring expenses for day ${dayOfMonth}`);
 

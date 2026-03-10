@@ -6,7 +6,9 @@ import {
   EXPENSE_CATEGORY,
   VALID_INCOME_CATEGORIES,
   VALID_EXPENSE_CATEGORIES,
+  EDITABLE_ENTRY_FIELDS,
   validateFinancialEntryRequest,
+  validateUpdateFinancialEntryRequest,
   buildFinancialEntry,
 } from '../lib/financial.js';
 
@@ -135,6 +137,146 @@ describe('validateFinancialEntryRequest', () => {
       description: 42,
     });
     expect(errors.length).toBeGreaterThanOrEqual(3);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// validateUpdateFinancialEntryRequest
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe('validateUpdateFinancialEntryRequest', () => {
+  const validUpdate = {
+    entryId: 'entry-123',
+    fields: { amount: 200 },
+  };
+
+  it('returns no errors for a valid single-field update', () => {
+    expect(validateUpdateFinancialEntryRequest(validUpdate)).toEqual([]);
+  });
+
+  it('returns no errors for a valid multi-field update', () => {
+    const errors = validateUpdateFinancialEntryRequest({
+      entryId: 'entry-123',
+      fields: { amount: 300, date: '2025-06-01', description: 'Updated' },
+    });
+    expect(errors).toEqual([]);
+  });
+
+  // entryId validation
+  it('requires entryId', () => {
+    const errors = validateUpdateFinancialEntryRequest({ fields: { amount: 100 } });
+    expect(errors.some((e) => e.includes('entryId'))).toBe(true);
+  });
+
+  it('rejects non-string entryId', () => {
+    const errors = validateUpdateFinancialEntryRequest({ entryId: 42, fields: { amount: 100 } });
+    expect(errors.some((e) => e.includes('entryId'))).toBe(true);
+  });
+
+  // fields validation
+  it('requires fields to be present', () => {
+    const errors = validateUpdateFinancialEntryRequest({ entryId: 'e1' });
+    expect(errors.some((e) => e.includes('fields is required'))).toBe(true);
+  });
+
+  it('rejects non-object fields', () => {
+    const errors = validateUpdateFinancialEntryRequest({ entryId: 'e1', fields: 'bad' });
+    expect(errors.some((e) => e.includes('fields is required'))).toBe(true);
+  });
+
+  it('rejects array as fields', () => {
+    const errors = validateUpdateFinancialEntryRequest({ entryId: 'e1', fields: [1, 2] });
+    expect(errors.some((e) => e.includes('fields is required'))).toBe(true);
+  });
+
+  it('rejects empty fields object with no valid keys', () => {
+    const errors = validateUpdateFinancialEntryRequest({ entryId: 'e1', fields: {} });
+    expect(errors.some((e) => e.includes('At least one field'))).toBe(true);
+  });
+
+  // Unknown fields
+  it('rejects unknown fields', () => {
+    const errors = validateUpdateFinancialEntryRequest({
+      entryId: 'e1',
+      fields: { amount: 100, source: 'manual' },
+    });
+    expect(errors.some((e) => e.includes('Unknown fields'))).toBe(true);
+    expect(errors.some((e) => e.includes('source'))).toBe(true);
+  });
+
+  // type validation
+  it('accepts valid type values', () => {
+    for (const type of Object.values(ENTRY_TYPE)) {
+      const errors = validateUpdateFinancialEntryRequest({ entryId: 'e1', fields: { type } });
+      expect(errors).toEqual([]);
+    }
+  });
+
+  it('rejects invalid type', () => {
+    const errors = validateUpdateFinancialEntryRequest({ entryId: 'e1', fields: { type: 'refund' } });
+    expect(errors.some((e) => e.includes('type must be one of'))).toBe(true);
+  });
+
+  // amount validation
+  it('rejects zero amount', () => {
+    const errors = validateUpdateFinancialEntryRequest({ entryId: 'e1', fields: { amount: 0 } });
+    expect(errors.some((e) => e.includes('amount'))).toBe(true);
+  });
+
+  it('rejects negative amount', () => {
+    const errors = validateUpdateFinancialEntryRequest({ entryId: 'e1', fields: { amount: -5 } });
+    expect(errors.some((e) => e.includes('amount'))).toBe(true);
+  });
+
+  it('rejects non-number amount', () => {
+    const errors = validateUpdateFinancialEntryRequest({ entryId: 'e1', fields: { amount: '100' } });
+    expect(errors.some((e) => e.includes('amount'))).toBe(true);
+  });
+
+  // date validation
+  it('accepts valid ISO date', () => {
+    const errors = validateUpdateFinancialEntryRequest({ entryId: 'e1', fields: { date: '2025-03-10' } });
+    expect(errors).toEqual([]);
+  });
+
+  it('rejects invalid date string', () => {
+    const errors = validateUpdateFinancialEntryRequest({ entryId: 'e1', fields: { date: 'not-a-date' } });
+    expect(errors.some((e) => e.includes('date must be a valid'))).toBe(true);
+  });
+
+  it('rejects empty string date', () => {
+    const errors = validateUpdateFinancialEntryRequest({ entryId: 'e1', fields: { date: '' } });
+    expect(errors.some((e) => e.includes('date must be a valid'))).toBe(true);
+  });
+
+  // description validation
+  it('accepts string description', () => {
+    const errors = validateUpdateFinancialEntryRequest({ entryId: 'e1', fields: { description: 'Updated note' } });
+    expect(errors).toEqual([]);
+  });
+
+  it('accepts null description', () => {
+    const errors = validateUpdateFinancialEntryRequest({ entryId: 'e1', fields: { description: null } });
+    expect(errors).toEqual([]);
+  });
+
+  it('rejects non-string non-null description', () => {
+    const errors = validateUpdateFinancialEntryRequest({ entryId: 'e1', fields: { description: 42 } });
+    expect(errors.some((e) => e.includes('description must be a string or null'))).toBe(true);
+  });
+
+  // Multiple errors collected
+  it('collects multiple errors at once', () => {
+    const errors = validateUpdateFinancialEntryRequest({
+      entryId: '',
+      fields: { amount: -1, date: 'bad', type: 'invalid', unknown: true },
+    });
+    expect(errors.length).toBeGreaterThanOrEqual(4);
+  });
+
+  // EDITABLE_ENTRY_FIELDS constant
+  it('EDITABLE_ENTRY_FIELDS contains expected fields', () => {
+    expect(EDITABLE_ENTRY_FIELDS).toEqual(['type', 'category', 'amount', 'date', 'description']);
   });
 });
 
